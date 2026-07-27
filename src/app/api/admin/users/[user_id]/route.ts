@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { authenticateRequest, successResponse, errorResponse, requireAdmin } from '@/server/api-helpers';
 import { AppError, ErrorCodes } from '@/server/errors';
 import { adminUpdateUserSchema } from '@/server/validation/admin-schemas';
+import { getQuotaUsage } from '@/server/quotas';
 
 const QUOTA_FIELDS = [
   'daily_image_limit',
@@ -50,19 +51,13 @@ export async function GET(
       .order('created_at', { ascending: false })
       .limit(10);
 
-    // Usage today
-    const today = new Date().toISOString().split('T')[0];
-    const { count: todayCount } = await supabase
-      .from('usage_records')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', profile.user_id)
-      .gte('created_at', today);
+    const usage = await getQuotaUsage(profile.user_id);
 
     return successResponse({
       profile,
       quota: quota || null,
       recent_tasks: recentTasks || [],
-      today_usage: todayCount || 0,
+      today_usage: usage.daily_used,
     }, auth.requestId);
   } catch (err) {
     return errorResponse(err, '');

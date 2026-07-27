@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server';
 import { authenticateRequest, successResponse, errorResponse, requireScope } from '@/server/api-helpers';
+import { parseInput, updateProfileSchema } from '@/server/validation/schemas';
 
 export async function GET(request: NextRequest) {
   try {
@@ -28,8 +29,7 @@ export async function PATCH(request: NextRequest) {
   try {
     const auth = await authenticateRequest(request);
     requireScope(auth, 'profile:write');
-    const body = await request.json();
-    const { display_name } = body;
+    const { display_name } = parseInput(updateProfileSchema, await request.json());
 
     const { getSupabaseServerClient } = await import('@/storage/database/supabase-client');
     const supabase = getSupabaseServerClient();

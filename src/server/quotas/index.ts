@@ -24,17 +24,30 @@ export async function getUserQuota(userId: string): Promise<UserQuota> {
     .single();
 
   if (error || !data) {
-    // Create default quota if not exists
+    // Create the default row safely when two first requests race.
     const { data: newQuota, error: createError } = await client
       .from('user_quotas')
-      .insert({ user_id: userId })
+      .upsert(
+        { user_id: userId },
+        { onConflict: 'user_id', ignoreDuplicates: true }
+      )
       .select()
-      .single();
+      .maybeSingle();
 
-    if (createError || !newQuota) {
+    if (createError) {
       throw new AppError(ErrorCodes.INTERNAL_ERROR, 'Failed to create user quota');
     }
-    return newQuota as unknown as UserQuota;
+    if (newQuota) return newQuota as unknown as UserQuota;
+
+    const { data: concurrentQuota, error: refetchError } = await client
+      .from('user_quotas')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
+    if (refetchError || !concurrentQuota) {
+      throw new AppError(ErrorCodes.INTERNAL_ERROR, 'Failed to load user quota');
+    }
+    return concurrentQuota as unknown as UserQuota;
   }
 
   return data as unknown as UserQuota;
@@ -93,48 +106,14 @@ export async function checkQuota(userId: string, modelCode: string): Promise<voi
     }
   }
 
-  // Check daily quota.
-  // Counts usage_records in {queued, running, succeeded} — i.e. "active
-  // quota slots". Failed records do NOT consume quota (the user should
-  // be able to retry without being penalised for provider errors).
-  // For this invariant to hold, retryTask in executor.ts MUST flip the
-  // matching usage_records row back to 'queued' so the retry consumes
-  // the existing slot rather than opening a new one.
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const { count: dailyCount } = await client
-    .from('usage_records')
-    .select('*', { count: 'exact', head: true })
-    .eq('user_id', userId)
-    .gte('created_at', today.toISOString())
-    .in('status', ['queued', 'running', 'succeeded']);
-
-  if (dailyCount !== null && dailyCount >= quota.daily_image_limit) {
+  const usage = await getQuotaUsage(userId);
+  if (usage.daily_used >= quota.daily_image_limit) {
     throw new AppError(ErrorCodes.QUOTA_EXCEEDED, 'Daily image generation limit exceeded');
   }
-
-  // Check monthly quota (same semantics as daily above).
-  const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
-  const { count: monthlyCount } = await client
-    .from('usage_records')
-    .select('*', { count: 'exact', head: true })
-    .eq('user_id', userId)
-    .gte('created_at', monthStart.toISOString())
-    .in('status', ['queued', 'running', 'succeeded']);
-
-  if (monthlyCount !== null && monthlyCount >= quota.monthly_image_limit) {
+  if (usage.monthly_used >= quota.monthly_image_limit) {
     throw new AppError(ErrorCodes.QUOTA_EXCEEDED, 'Monthly image generation limit exceeded');
   }
-
-  // Check concurrent tasks
-  const { count: activeCount } = await client
-    .from('generation_tasks')
-    .select('*', { count: 'exact', head: true })
-    .eq('user_id', userId)
-    .in('status', ['queued', 'running'])
-    .is('deleted_at', null);
-
-  if (activeCount !== null && activeCount >= quota.max_concurrent_tasks) {
+  if (usage.active_tasks >= quota.max_concurrent_tasks) {
     throw new AppError(ErrorCodes.CONCURRENCY_LIMITED, 'Maximum concurrent tasks reached');
   }
 }
@@ -150,37 +129,28 @@ export async function getQuotaUsage(userId: string): Promise<{
   const client = getSupabaseClient();
   const quota = await getUserQuota(userId);
 
-  const today = new Date();
-  today.setHours(0, 0, 0, 0);
-  const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
-
-  const { count: dailyUsed } = await client
-    .from('usage_records')
-    .select('*', { count: 'exact', head: true })
-    .eq('user_id', userId)
-    .gte('created_at', today.toISOString())
-    .in('status', ['queued', 'running', 'succeeded']);
-
-  const { count: monthlyUsed } = await client
-    .from('usage_records')
-    .select('*', { count: 'exact', head: true })
-    .eq('user_id', userId)
-    .gte('created_at', monthStart.toISOString())
-    .in('status', ['queued', 'running', 'succeeded']);
-
-  const { count: activeTasks } = await client
-    .from('generation_tasks')
-    .select('*', { count: 'exact', head: true })
-    .eq('user_id', userId)
-    .in('status', ['queued', 'running'])
-    .is('deleted_at', null);
+  const { data, error } = await client.rpc('get_generation_quota_usage', {
+    p_user_id: userId,
+  });
+  if (error || !data) {
+    logger.error('Failed to fetch quota usage', {
+      user_id: userId,
+      error: error?.message,
+    });
+    throw new AppError(ErrorCodes.INTERNAL_ERROR, 'Failed to fetch quota usage');
+  }
+  const usage = data as unknown as {
+    daily_used: number;
+    monthly_used: number;
+    active_tasks: number;
+  };
 
   return {
-    daily_used: dailyUsed || 0,
+    daily_used: Number(usage.daily_used) || 0,
     daily_limit: quota.daily_image_limit,
-    monthly_used: monthlyUsed || 0,
+    monthly_used: Number(usage.monthly_used) || 0,
     monthly_limit: quota.monthly_image_limit,
-    active_tasks: activeTasks || 0,
+    active_tasks: Number(usage.active_tasks) || 0,
     max_concurrent: quota.max_concurrent_tasks,
   };
 }

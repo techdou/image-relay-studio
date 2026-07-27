@@ -44,7 +44,7 @@ echo "Bootstrapping admin user: $ADMIN_EMAIL (token present: yes)"
 # The JS source below reads `process.env.ADMIN_EMAIL` and never embeds the
 # value as a string literal, so it is immune to shell/JS injection via the
 # email value.
-npx tsx -e '
+pnpm exec tsx -e '
 const { getSupabaseServerClient } = require("./src/storage/database/supabase-client");
 
 async function bootstrap() {

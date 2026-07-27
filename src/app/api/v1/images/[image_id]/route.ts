@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
-import { authenticateRequest, successResponse, errorResponse } from '@/server/api-helpers';
+import { authenticateRequest, successResponse, errorResponse, requireScope } from '@/server/api-helpers';
 import { AppError, ErrorCodes } from '@/server/errors';
+import { parseInput, updateImageSchema } from '@/server/validation/schemas';
 
 export async function GET(
   request: NextRequest,
@@ -9,6 +10,7 @@ export async function GET(
   try {
     const { image_id } = await params;
     const auth = await authenticateRequest(request);
+    requireScope(auth, 'images:read');
     const { getSupabaseServerClient } = await import('@/storage/database/supabase-client');
     const supabase = getSupabaseServerClient();
 
@@ -48,8 +50,8 @@ export async function PATCH(
   try {
     const { image_id } = await params;
     const auth = await authenticateRequest(request);
-    const body = await request.json();
-    const { favorite } = body;
+    requireScope(auth, 'images:write');
+    const { favorite } = parseInput(updateImageSchema, await request.json());
 
     const { getSupabaseServerClient } = await import('@/storage/database/supabase-client');
     const supabase = getSupabaseServerClient();
@@ -91,6 +93,7 @@ export async function DELETE(
   try {
     const { image_id } = await params;
     const auth = await authenticateRequest(request);
+    requireScope(auth, 'images:write');
 
     const { getSupabaseServerClient } = await import('@/storage/database/supabase-client');
     const supabase = getSupabaseServerClient();

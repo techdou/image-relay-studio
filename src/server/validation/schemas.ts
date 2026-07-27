@@ -1,4 +1,20 @@
 import { z } from 'zod';
+import { AppError, ErrorCodes } from '@/server/errors';
+
+export function parseInput<TSchema extends z.ZodType>(
+  schema: TSchema,
+  input: unknown
+): z.infer<TSchema> {
+  const result = schema.safeParse(input);
+  if (!result.success) {
+    throw new AppError(
+      ErrorCodes.VALIDATION_ERROR,
+      result.error.issues[0]?.message || 'Invalid request',
+      { issues: result.error.issues }
+    );
+  }
+  return result.data;
+}
 
 export const loginSchema = z.object({
   email: z.string().email('Invalid email format'),
@@ -11,10 +27,53 @@ export const createGenerationTaskSchema = z.object({
   size: z.string().optional().default('2K'),
   n: z.number().int().min(1).max(4).optional().default(1),
   reference_asset_ids: z.array(z.string().uuid()).optional().default([]),
-  visible_watermark: z.boolean().optional().default(true),
+  visible_watermark: z.boolean().optional().default(false),
   idempotency_key: z.string().max(128).optional(),
   task_type: z.enum(['text_to_image', 'image_to_image']).optional().default('text_to_image'),
 });
+
+export const openAiImageGenerationSchema = z.object({
+  model: z.string().min(1).optional().default('image-pro'),
+  prompt: z.string().trim().min(1, 'Prompt is required').max(4000, 'Prompt too long'),
+  size: z.string().min(1).optional(),
+  n: z.number().int().min(1).max(4).optional().default(1),
+  response_format: z.enum(['url', 'b64_json']).optional().default('url'),
+  reference_asset_ids: z.array(z.string().uuid()).max(4).optional().default([]),
+  visible_watermark: z.boolean().optional().default(false),
+  idempotency_key: z.string().min(1).max(128).optional(),
+}).passthrough();
+
+export const imageEditFieldsSchema = z.object({
+  model: z.string().min(1).default('dall-e-2'),
+  prompt: z.string().trim().min(1, 'Prompt is required').max(4000, 'Prompt too long'),
+  size: z.string().min(1).default('1024x1024'),
+  n: z.coerce.number().int().min(1).max(4).default(1),
+  response_format: z.enum(['url', 'b64_json']).default('url'),
+});
+
+export const imageListQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  page_size: z.coerce.number().int().min(1).max(100).default(24),
+  favorite: z.enum(['true', 'false']).optional(),
+  task_id: z.string().uuid().optional(),
+});
+
+export const updateImageSchema = z.object({
+  favorite: z.boolean(),
+}).strict();
+
+export const API_KEY_SCOPES = [
+  'images:read',
+  'images:write',
+  'tasks:read',
+  'tasks:write',
+  'models:read',
+  'usage:read',
+  'api_keys:read',
+  'api_keys:write',
+  'profile:read',
+  'profile:write',
+] as const;
 
 export const retryTaskSchema = z.object({
   task_id: z.string().uuid('Invalid task ID'),
@@ -25,10 +84,12 @@ export const cancelTaskSchema = z.object({
 });
 
 export const createApiKeySchema = z.object({
-  name: z.string().min(1, 'Name is required').max(128),
-  scopes: z.array(z.string()).optional().default(['images:read', 'images:write']),
+  name: z.string().trim().min(1, 'Name is required').max(128),
+  scopes: z.array(z.enum(API_KEY_SCOPES)).max(API_KEY_SCOPES.length)
+    .optional()
+    .default(['images:read', 'images:write']),
   expires_at: z.string().datetime().optional(),
-});
+}).strict();
 
 export const revokeApiKeySchema = z.object({
   key_id: z.string().uuid('Invalid key ID'),
@@ -99,6 +160,7 @@ export const imageUploadConstraints = {
 
 export type LoginInput = z.infer<typeof loginSchema>;
 export type CreateGenerationTaskInput = z.infer<typeof createGenerationTaskSchema>;
+export type OpenAiImageGenerationInput = z.infer<typeof openAiImageGenerationSchema>;
 export type CreateApiKeyInput = z.infer<typeof createApiKeySchema>;
 export type UpdateProfileInput = z.infer<typeof updateProfileSchema>;
 export type UpdateUserQuotaInput = z.infer<typeof updateUserQuotaSchema>;

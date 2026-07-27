@@ -3,6 +3,7 @@ import { authenticateRequest, successResponse, errorResponse, requireScope } fro
 import { AppError, ErrorCodes } from '@/server/errors';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { createApiKey } from '@/server/api-keys';
+import { createApiKeySchema, parseInput } from '@/server/validation/schemas';
 
 export async function GET(request: NextRequest) {
   try {
@@ -51,23 +52,28 @@ export async function POST(request: NextRequest) {
   try {
     const auth = await authenticateRequest(request);
     requireScope(auth, 'api_keys:write');
-    const body = await request.json();
-    const { name, expires_at, scopes } = body;
-
-    if (!name || !name.trim()) {
-      throw new AppError(ErrorCodes.INVALID_REQUEST, '请输入密钥名称');
-    }
+    const { name, expires_at, scopes } = parseInput(
+      createApiKeySchema,
+      await request.json()
+    );
 
     const supabase = getSupabaseClient();
 
     // Check API access enabled
-    const { data: quota } = await supabase
-      .from('user_quotas')
-      .select('api_access_enabled')
-      .eq('user_id', auth.userId)
-      .single();
+    const [{ data: quota }, { data: apiSetting }] = await Promise.all([
+      supabase
+        .from('user_quotas')
+        .select('api_access_enabled')
+        .eq('user_id', auth.userId)
+        .single(),
+      supabase
+        .from('system_settings')
+        .select('value')
+        .eq('key', 'api_enabled')
+        .maybeSingle(),
+    ]);
 
-    if (!quota?.api_access_enabled) {
+    if (!quota?.api_access_enabled || apiSetting?.value !== 'true') {
       throw new AppError(ErrorCodes.API_DISABLED, 'API 访问未启用');
     }
 
@@ -76,8 +82,8 @@ export async function POST(request: NextRequest) {
     //   images:read / images:write (NOT the legacy "images:generate").
     const result = await createApiKey(
       auth.userId,
-      name.trim(),
-      scopes || ['images:write', 'images:read', 'tasks:read', 'tasks:write', 'models:read', 'usage:read'],
+      name,
+      scopes,
       expires_at || undefined
     );
 

@@ -6,12 +6,16 @@ import {
   enforceGenerationRateLimit,
   requireScope,
 } from '@/server/api-helpers';
-import { AppError, ErrorCodes } from '@/server/errors';
+import { AppError, ErrorCodes, errorStatusMap } from '@/server/errors';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { createTask, executeTaskSync } from '@/server/tasks/executor';
 import type { TaskType } from '@/server/tasks/state-machine';
 import { generateSignedUrl } from '@/server/storage';
 import { logger } from '@/server/logging';
+import {
+  openAiImageGenerationSchema,
+  parseInput,
+} from '@/server/validation/schemas';
 
 // ---------------------------------------------------------------------------
 // OpenAI-compatible size mapping
@@ -78,33 +82,21 @@ export async function POST(request: NextRequest) {
     requireScope(auth, 'images:write');
     enforceGenerationRateLimit(auth.userId);
 
-    const body = await request.json();
-
+    const body = parseInput(openAiImageGenerationSchema, await request.json());
     const {
       model: rawModel,
       prompt,
       size: rawSize,
-      n = 1,
-      response_format: responseFormat = 'url',
+      n,
+      response_format: responseFormat,
       // Our extended fields (still supported)
-      reference_asset_ids = [],
-      visible_watermark = false,
+      reference_asset_ids,
+      visible_watermark,
       idempotency_key,
     } = body;
 
-    const modelCode = resolveModel(rawModel || 'image-pro');
+    const modelCode = resolveModel(rawModel);
     const size = resolveSize(rawSize, modelCode);
-
-    // ── Validate ──────────────────────────────────────────────────────
-    if (!prompt || typeof prompt !== 'string' || prompt.trim().length === 0) {
-      throw new AppError(ErrorCodes.INVALID_REQUEST, 'prompt is required and cannot be empty');
-    }
-    if (n < 1 || n > 4) {
-      throw new AppError(ErrorCodes.INVALID_REQUEST, 'n must be between 1 and 4');
-    }
-    if (responseFormat !== 'url' && responseFormat !== 'b64_json') {
-      throw new AppError(ErrorCodes.INVALID_REQUEST, 'response_format must be "url" or "b64_json"');
-    }
 
     // ── Content moderation (basic prompt check) ────────────────────────
     const trimmedPrompt = prompt.trim();
@@ -115,7 +107,7 @@ export async function POST(request: NextRequest) {
       // stage / decision / reason / rule_codes(jsonb) / metadata(jsonb).
       const supabase = getSupabaseClient();
       try {
-        await supabase.from('moderation_events').insert({
+        const { error: moderationError } = await supabase.from('moderation_events').insert({
           user_id: auth.userId,
           task_id: null,
           stage: 'pre_generation',
@@ -124,6 +116,7 @@ export async function POST(request: NextRequest) {
           rule_codes: moderationFlags,
           metadata: { prompt: trimmedPrompt },
         });
+        if (moderationError) throw moderationError;
       } catch (modErr) {
         logger.warn('Failed to record moderation event', {
           user_id: auth.userId,
@@ -196,49 +189,15 @@ export async function POST(request: NextRequest) {
       throw new AppError(ErrorCodes.INVALID_REQUEST, `Maximum ${maxPerRequest} images per request`);
     }
 
-    // 8. Check daily quota (only count succeeded generations)
-    const today = new Date().toISOString().split('T')[0];
-    const { count: todayCount } = await supabase
-      .from('usage_records')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', auth.userId)
-      .eq('status', 'succeeded')
-      .gte('created_at', today);
-    const dailyLimit = quota?.daily_image_limit || 50;
-    if ((todayCount || 0) + n > dailyLimit) {
-      throw new AppError(ErrorCodes.QUOTA_EXCEEDED, 'Daily image generation quota exceeded');
-    }
-
-    // 9. Check monthly quota (only count succeeded generations)
-    const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().split('T')[0];
-    const { count: monthCount } = await supabase
-      .from('usage_records')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', auth.userId)
-      .eq('status', 'succeeded')
-      .gte('created_at', monthStart);
-    const monthlyLimit = quota?.monthly_image_limit || 500;
-    if ((monthCount || 0) + n > monthlyLimit) {
-      throw new AppError(ErrorCodes.QUOTA_EXCEEDED, 'Monthly image generation quota exceeded');
-    }
-
-    // 10. Check concurrency
-    const maxConcurrent = quota?.max_concurrent_tasks || 3;
-    const { count: activeCount } = await supabase
-      .from('generation_tasks')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', auth.userId)
-      .in('status', ['queued', 'running']);
-    if ((activeCount || 0) >= maxConcurrent) {
-      throw new AppError(ErrorCodes.CONCURRENCY_LIMITED, 'Too many concurrent generation tasks');
-    }
-
-    // 11. Check watermark support
+    // 8. Check watermark and sequential-generation support
     if (visible_watermark && !modelConfig.supports_visible_watermark_control) {
       throw new AppError(ErrorCodes.INVALID_REQUEST, 'This model does not support watermark control');
     }
+    if (n > 1 && !modelConfig.supports_sequential_generation) {
+      throw new AppError(ErrorCodes.INVALID_REQUEST, 'This model does not support multiple images per request');
+    }
 
-    // 12. Determine task type
+    // 9. Determine task type
     const taskType: TaskType = reference_asset_ids.length > 0 ? 'image_to_image' : 'text_to_image';
     if (taskType === 'image_to_image' && !modelConfig.supports_image_to_image) {
       throw new AppError(ErrorCodes.INVALID_REQUEST, 'This model does not support image-to-image');
@@ -255,6 +214,7 @@ export async function POST(request: NextRequest) {
       reference_asset_ids: reference_asset_ids.length > 0 ? reference_asset_ids : undefined,
       custom_headers: forwardHeaders,
       requestSource: auth.authMethod === 'apikey' ? 'api' : 'web',
+      api_key_id: auth.apiKeyId,
     });
 
     // ── Execute synchronously (OpenAI-compatible) ─────────────────────
@@ -288,25 +248,7 @@ export async function POST(request: NextRequest) {
   } catch (err) {
     // OpenAI-compatible error format
     if (err instanceof AppError) {
-      const statusMap: Record<string, number> = {
-        UNAUTHORIZED: 401,
-        FORBIDDEN: 403,
-        USER_DISABLED: 403,
-        API_DISABLED: 403,
-        GENERATION_DISABLED: 503,
-        INVALID_REQUEST: 400,
-        MODEL_NOT_FOUND: 404,
-        MODEL_NOT_ALLOWED: 403,
-        SIZE_NOT_ALLOWED: 400,
-        QUOTA_EXCEEDED: 429,
-        CONCURRENCY_LIMITED: 429,
-        PROVIDER_TIMEOUT: 504,
-        PROVIDER_ERROR: 502,
-        RATE_LIMITED: 429,
-        API_KEY_INVALID: 401,
-        API_KEY_EXPIRED: 401,
-      };
-      const status = statusMap[err.code] || 500;
+      const status = errorStatusMap[err.code] || 500;
       return NextResponse.json(
         {
           error: {

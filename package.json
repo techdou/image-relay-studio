@@ -5,12 +5,13 @@
   "scripts": {
     "build": "bash ./scripts/build.sh",
     "dev": "bash ./scripts/dev.sh",
-    "preinstall": "npx only-allow pnpm",
+    "preinstall": "only-allow pnpm",
     "lint": "eslint",
     "lint:build": "eslint . --quiet",
     "start": "bash ./scripts/start.sh",
+    "test": "tsx --test tests/**/*.test.ts",
     "ts-check": "tsc -p tsconfig.json",
-    "validate": "pnpm run --parallel '/^(ts-check|lint:build)$/'"
+    "validate": "pnpm ts-check && pnpm lint:build && pnpm test"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.958.0",

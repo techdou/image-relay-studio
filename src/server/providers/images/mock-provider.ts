@@ -26,7 +26,7 @@ export class MockImageProvider implements ImageGenerationProvider {
     await new Promise((resolve) => setTimeout(resolve, 500 + Math.random() * 1000));
 
     const count = request.sequential_generation === 'auto'
-      ? Math.min(request.sequential_max_images || 3, 3)
+      ? Math.min(request.sequential_max_images || 4, 4)
       : 1;
 
     // Generate mock placeholder images (1x1 PNG base64)

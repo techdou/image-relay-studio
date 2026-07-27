@@ -19,9 +19,10 @@ export interface AuditLogEntry {
 export async function createAuditLog(entry: AuditLogEntry): Promise<void> {
   try {
     const client = getSupabaseClient();
-    await client.from('audit_logs').insert({
+    const { error } = await client.from('audit_logs').insert({
       ...entry,
     });
+    if (error) throw error;
   } catch (error) {
     logger.error('Failed to create audit log', {
       error: error instanceof Error ? error.message : 'Unknown',

@@ -54,7 +54,7 @@ export const userQuotas = pgTable(
   "user_quotas",
   {
     id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
-    user_id: uuid("user_id").notNull().unique().references(() => profiles.id, { onDelete: "cascade" }),
+    user_id: uuid("user_id").notNull().unique().references(() => profiles.user_id, { onDelete: "cascade" }),
     daily_image_limit: integer("daily_image_limit").notNull().default(20),
     monthly_image_limit: integer("monthly_image_limit").notNull().default(200),
     max_concurrent_tasks: integer("max_concurrent_tasks").notNull().default(2),
@@ -112,7 +112,7 @@ export const generationTasks = pgTable(
   "generation_tasks",
   {
     id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
-    user_id: uuid("user_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+    user_id: uuid("user_id").notNull().references(() => profiles.user_id, { onDelete: "cascade" }),
     model_config_id: uuid("model_config_id").notNull().references(() => modelConfigs.id),
     task_type: varchar("task_type", { length: 32 }).notNull(),
     status: varchar("status", { length: 20 }).notNull().default("queued"),
@@ -161,7 +161,7 @@ export const generationReferences = pgTable(
   {
     id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
     task_id: uuid("task_id").references(() => generationTasks.id, { onDelete: "cascade" }),
-    user_id: uuid("user_id").notNull(),
+    user_id: uuid("user_id").notNull().references(() => profiles.user_id, { onDelete: "cascade" }),
     object_key: varchar("object_key", { length: 512 }).notNull(),
     original_filename: varchar("original_filename", { length: 256 }),
     mime_type: varchar("mime_type", { length: 64 }),
@@ -185,7 +185,7 @@ export const generationAssets = pgTable(
   {
     id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
     task_id: uuid("task_id").notNull().references(() => generationTasks.id, { onDelete: "cascade" }),
-    user_id: uuid("user_id").notNull(),
+    user_id: uuid("user_id").notNull().references(() => profiles.user_id, { onDelete: "cascade" }),
     object_key: varchar("object_key", { length: 512 }).notNull(),
     thumbnail_key: varchar("thumbnail_key", { length: 512 }),
     original_filename: varchar("original_filename", { length: 256 }),
@@ -218,7 +218,7 @@ export const apiKeys = pgTable(
   "api_keys",
   {
     id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
-    user_id: uuid("user_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+    user_id: uuid("user_id").notNull().references(() => profiles.user_id, { onDelete: "cascade" }),
     name: varchar("name", { length: 128 }).notNull(),
     key_prefix: varchar("key_prefix", { length: 16 }).notNull(),
     key_hash: varchar("key_hash", { length: 128 }).notNull(),
@@ -242,7 +242,7 @@ export const usageRecords = pgTable(
   "usage_records",
   {
     id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
-    user_id: uuid("user_id").notNull().references(() => profiles.id, { onDelete: "cascade" }),
+    user_id: uuid("user_id").notNull().references(() => profiles.user_id, { onDelete: "cascade" }),
     task_id: uuid("task_id").references(() => generationTasks.id, { onDelete: "cascade" }),
     api_key_id: uuid("api_key_id").references(() => apiKeys.id, { onDelete: "set null" }),
     model_config_id: uuid("model_config_id").references(() => modelConfigs.id, { onDelete: "set null" }),
@@ -270,7 +270,7 @@ export const auditLogs = pgTable(
   "audit_logs",
   {
     id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
-    actor_user_id: uuid("actor_user_id").references(() => profiles.id, { onDelete: "set null" }),
+    actor_user_id: uuid("actor_user_id").references(() => profiles.user_id, { onDelete: "set null" }),
     actor_role: varchar("actor_role", { length: 20 }),
     action: varchar("action", { length: 128 }).notNull(),
     resource_type: varchar("resource_type", { length: 64 }),
@@ -301,7 +301,7 @@ export const systemSettings = pgTable(
     key: varchar("key", { length: 128 }).notNull().unique(),
     value: text("value").notNull(),
     description: text("description"),
-    updated_by: uuid("updated_by").references(() => profiles.id, { onDelete: "set null" }),
+    updated_by: uuid("updated_by").references(() => profiles.user_id, { onDelete: "set null" }),
     created_at: timestamp("created_at", { withTimezone: true }).defaultNow().notNull(),
     updated_at: timestamp("updated_at", { withTimezone: true }).defaultNow().notNull(),
   },
@@ -318,7 +318,7 @@ export const moderationEvents = pgTable(
   {
     id: uuid("id").primaryKey().default(sql`gen_random_uuid()`),
     task_id: uuid("task_id").references(() => generationTasks.id, { onDelete: "cascade" }),
-    user_id: uuid("user_id").references(() => profiles.id, { onDelete: "cascade" }),
+    user_id: uuid("user_id").references(() => profiles.user_id, { onDelete: "cascade" }),
     stage: varchar("stage", { length: 32 }).notNull(),
     decision: varchar("decision", { length: 32 }).notNull(),
     reason: text("reason"),

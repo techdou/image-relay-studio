@@ -4,12 +4,20 @@ import {
   enforceGenerationRateLimit,
   requireScope,
 } from '@/server/api-helpers';
-import { AppError, ErrorCodes } from '@/server/errors';
+import { AppError, ErrorCodes, errorStatusMap } from '@/server/errors';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { createTask, executeTaskSync } from '@/server/tasks/executor';
 import { uploadFile } from '@/server/storage';
 import { logger } from '@/server/logging';
 import { HeaderUtils } from 'coze-coding-dev-sdk';
+import {
+  detectImageMimeType,
+  readImageDimensions,
+} from '@/server/images/image-utils';
+import {
+  imageEditFieldsSchema,
+  parseInput,
+} from '@/server/validation/schemas';
 
 // ---------------------------------------------------------------------------
 // OpenAI-compatible size mapping
@@ -36,86 +44,6 @@ function resolveModel(model: string): string {
 function resolveSize(size: string | undefined): string {
   if (!size) return '2K';
   return OPENAI_SIZE_MAP[size] || size;
-}
-
-// ---------------------------------------------------------------------------
-// MIME type detection from magic bytes
-// ---------------------------------------------------------------------------
-function detectMimeType(buffer: Buffer): string | null {
-  if (buffer.length < 4) return null;
-  // PNG: 89 50 4E 47
-  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) {
-    return 'image/png';
-  }
-  // JPEG: FF D8 FF
-  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
-    return 'image/jpeg';
-  }
-  // WebP: 52 49 46 46 ... 57 45 42 50
-  if (
-    buffer.length >= 12 &&
-    buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
-    buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50
-  ) {
-    return 'image/webp';
-  }
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// Image dimension reader (supports PNG + JPEG)
-// ---------------------------------------------------------------------------
-function readPngDimensions(buffer: Buffer): { width: number; height: number } | null {
-  if (buffer.length < 33) return null;
-  if (
-    buffer[0] !== 0x89 || buffer[1] !== 0x50 || buffer[2] !== 0x4e || buffer[3] !== 0x47 ||
-    buffer[4] !== 0x0d || buffer[5] !== 0x0a || buffer[6] !== 0x1a || buffer[7] !== 0x0a
-  ) {
-    return null;
-  }
-  const width = buffer.readUInt32BE(16);
-  const height = buffer.readUInt32BE(20);
-  return { width, height };
-}
-
-function readJpegDimensions(buffer: Buffer): { width: number; height: number } | null {
-  // JPEG: starts with FF D8 FF
-  if (buffer[0] !== 0xff || buffer[1] !== 0xd8 || buffer[2] !== 0xff) return null;
-
-  let offset = 2;
-  while (offset < buffer.length - 1) {
-    if (buffer[offset] !== 0xff) { offset++; continue; }
-    const marker = buffer[offset + 1];
-
-    // SOF0 (Baseline) or SOF2 (Progressive): contain dimensions
-    if (
-      (marker >= 0xc0 && marker <= 0xc3) ||
-      (marker >= 0xc5 && marker <= 0xc7) ||
-      (marker >= 0xc9 && marker <= 0xcb) ||
-      (marker >= 0xcd && marker <= 0xcf)
-    ) {
-      if (offset + 8 > buffer.length) return null;
-      const height = buffer.readUInt16BE(offset + 5);
-      const width = buffer.readUInt16BE(offset + 7);
-      return { width, height };
-    }
-
-    // Skip markers without payload (RST, SOI, EOI)
-    if (marker >= 0xd0 && marker <= 0xd9) { offset += 2; continue; }
-
-    // Read segment length and skip
-    if (offset + 3 > buffer.length) return null;
-    const segLen = buffer.readUInt16BE(offset + 2);
-    offset += 2 + segLen;
-  }
-  return null;
-}
-
-function readImageDimensions(buffer: Buffer, mimeType: string): { width: number; height: number } | null {
-  if (mimeType === 'image/png') return readPngDimensions(buffer);
-  if (mimeType === 'image/jpeg') return readJpegDimensions(buffer);
-  // Try PNG first, then JPEG
-  return readPngDimensions(buffer) || readJpegDimensions(buffer);
 }
 
 // ---------------------------------------------------------------------------
@@ -156,13 +84,24 @@ export async function POST(request: NextRequest) {
     // OpenAI SDKs (Python openai, Node openai, etc.) send "image[]" not "image".
     // We also support "reference_image" (singular or multiple) for
     // additional reference images that provide style/subject guidance.
-    let imageFile: File | null = formData.get('image') as File | null;
-    const promptRaw = formData.get('prompt') as string | null;
-    const maskFile = formData.get('mask') as File | null;
-    const rawModel = (formData.get('model') as string) || 'dall-e-2';
-    const rawSize = (formData.get('size') as string) || '1024x1024';
-    const nRaw = formData.get('n') as string | null;
-    const responseFormat = (formData.get('response_format') as string) || 'url';
+    const initialImage = formData.get('image');
+    let imageFile: File | null = initialImage instanceof File ? initialImage : null;
+    const maskValue = formData.get('mask');
+    const maskFile = maskValue instanceof File ? maskValue : null;
+    const fields = parseInput(imageEditFieldsSchema, {
+      model: formData.get('model') || undefined,
+      prompt: formData.get('prompt'),
+      size: formData.get('size') || undefined,
+      n: formData.get('n') || undefined,
+      response_format: formData.get('response_format') || undefined,
+    });
+    const {
+      model: rawModel,
+      prompt,
+      size: rawSize,
+      n,
+      response_format: responseFormat,
+    } = fields;
 
     // Collect reference_image files (can be multiple via repeated field names)
     const referenceImageFiles: File[] = [];
@@ -176,17 +115,10 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    const n = nRaw ? parseInt(nRaw, 10) : 1;
-
     // ── Validate required fields ───────────────────────────────────────
     if (!imageFile) {
       throw new AppError(ErrorCodes.INVALID_REQUEST, 'image is required');
     }
-    if (!promptRaw || typeof promptRaw !== 'string' || promptRaw.trim().length === 0) {
-      throw new AppError(ErrorCodes.INVALID_REQUEST, 'prompt is required and cannot be empty');
-    }
-    const prompt = promptRaw.trim();
-
     // ── Validate image file ────────────────────────────────────────────
     if (!ALLOWED_MIME.includes(imageFile.type) && !imageFile.type.startsWith('image/')) {
       throw new AppError(ErrorCodes.INVALID_FILE, `image must be a valid image file (PNG, JPEG, or WebP), got: ${imageFile.type}`);
@@ -197,7 +129,10 @@ export async function POST(request: NextRequest) {
 
     const imageBuffer = Buffer.from(await imageFile.arrayBuffer());
     // Detect actual MIME from magic bytes (don't trust Content-Type from browser)
-    const actualImageMime = detectMimeType(imageBuffer) || imageFile.type || 'image/png';
+    const actualImageMime = detectImageMimeType(imageBuffer);
+    if (!actualImageMime) {
+      throw new AppError(ErrorCodes.INVALID_FILE, 'image content is not a supported PNG, JPEG, or WebP file');
+    }
     const imageMime = actualImageMime;
     const imageDims = readImageDimensions(imageBuffer, imageMime);
     if (!imageDims) {
@@ -218,7 +153,10 @@ export async function POST(request: NextRequest) {
         throw new AppError(ErrorCodes.INVALID_FILE, 'reference_image must be less than 4MB');
       }
       const refBuf = Buffer.from(await refFile.arrayBuffer());
-      const actualRefMime = detectMimeType(refBuf) || refFile.type || 'image/png';
+      const actualRefMime = detectImageMimeType(refBuf);
+      if (!actualRefMime) {
+        throw new AppError(ErrorCodes.INVALID_FILE, 'reference_image content is not a supported image');
+      }
       const refDims = readImageDimensions(refBuf, actualRefMime);
       if (!refDims) {
         throw new AppError(ErrorCodes.INVALID_FILE, 'reference_image could not be read — must be a valid image');
@@ -243,7 +181,10 @@ export async function POST(request: NextRequest) {
         }
 
         maskBuffer = Buffer.from(await maskFile.arrayBuffer());
-        const actualMaskMime = detectMimeType(maskBuffer) || maskFile.type || 'image/png';
+        const actualMaskMime = detectImageMimeType(maskBuffer);
+        if (!actualMaskMime) {
+          throw new AppError(ErrorCodes.INVALID_FILE, 'mask content is not a supported image');
+        }
         maskMime = actualMaskMime;
         maskDims = readImageDimensions(maskBuffer, maskMime);
         if (!maskDims) {
@@ -256,14 +197,6 @@ export async function POST(request: NextRequest) {
           );
         }
       }
-    }
-
-    // ── Validate other params ──────────────────────────────────────────
-    if (isNaN(n) || n < 1 || n > 10) {
-      throw new AppError(ErrorCodes.INVALID_REQUEST, 'n must be between 1 and 10');
-    }
-    if (responseFormat !== 'url' && responseFormat !== 'b64_json') {
-      throw new AppError(ErrorCodes.INVALID_REQUEST, 'response_format must be "url" or "b64_json"');
     }
 
     const modelCode = resolveModel(rawModel);
@@ -336,40 +269,8 @@ export async function POST(request: NextRequest) {
     if (n > maxPerRequest) {
       throw new AppError(ErrorCodes.INVALID_REQUEST, `Maximum ${maxPerRequest} images per request`);
     }
-
-    // 10. Check daily quota
-    const today = new Date().toISOString().split('T')[0];
-    const { count: todayCount } = await supabase
-      .from('usage_records')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', auth.userId)
-      .gte('created_at', today);
-    const dailyLimit = quota?.daily_image_limit || 50;
-    if ((todayCount || 0) + n > dailyLimit) {
-      throw new AppError(ErrorCodes.QUOTA_EXCEEDED, 'Daily image generation quota exceeded');
-    }
-
-    // 11. Check monthly quota
-    const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString().split('T')[0];
-    const { count: monthCount } = await supabase
-      .from('usage_records')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', auth.userId)
-      .gte('created_at', monthStart);
-    const monthlyLimit = quota?.monthly_image_limit || 500;
-    if ((monthCount || 0) + n > monthlyLimit) {
-      throw new AppError(ErrorCodes.QUOTA_EXCEEDED, 'Monthly image generation quota exceeded');
-    }
-
-    // 12. Check concurrency
-    const maxConcurrent = quota?.max_concurrent_tasks || 3;
-    const { count: activeCount } = await supabase
-      .from('generation_tasks')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', auth.userId)
-      .in('status', ['queued', 'running']);
-    if ((activeCount || 0) >= maxConcurrent) {
-      throw new AppError(ErrorCodes.CONCURRENCY_LIMITED, 'Too many concurrent generation tasks');
+    if (n > 1 && !modelConfig.supports_sequential_generation) {
+      throw new AppError(ErrorCodes.INVALID_REQUEST, 'This model does not support multiple images per request');
     }
 
     // ── Upload source image to object storage (for provenance) ─────────
@@ -414,10 +315,10 @@ export async function POST(request: NextRequest) {
     // ── Store provenance references ────────────────────────────────────
     const referenceAssetIds: string[] = [];
 
-    const { data: sourceRef } = await supabase
+    const { data: sourceRef, error: sourceRefError } = await supabase
       .from('generation_references')
       .insert({
-        task_id: '00000000-0000-0000-0000-000000000000',
+        task_id: null,
         user_id: auth.userId,
         object_key: imageObjectKey,
         original_filename: imageFile.name || 'source.png',
@@ -428,14 +329,17 @@ export async function POST(request: NextRequest) {
       })
       .select('id')
       .single();
+    if (sourceRefError || !sourceRef) {
+      throw new AppError(ErrorCodes.INTERNAL_ERROR, 'Failed to store source image provenance');
+    }
     if (sourceRef) referenceAssetIds.push(sourceRef.id);
 
     for (let i = 0; i < referenceBuffers.length; i++) {
       const ref = referenceBuffers[i];
-      const { data: refData } = await supabase
+      const { data: refData, error: refInsertError } = await supabase
         .from('generation_references')
         .insert({
-          task_id: '00000000-0000-0000-0000-000000000000',
+          task_id: null,
           user_id: auth.userId,
           object_key: referenceObjectKeys[i],
           original_filename: ref.name || `reference_${i}.png`,
@@ -446,14 +350,17 @@ export async function POST(request: NextRequest) {
         })
         .select('id')
         .single();
+      if (refInsertError || !refData) {
+        throw new AppError(ErrorCodes.INTERNAL_ERROR, 'Failed to store reference image provenance');
+      }
       if (refData) referenceAssetIds.push(refData.id);
     }
 
     if (maskObjectKey) {
-      const { data: maskRef } = await supabase
+      const { data: maskRef, error: maskRefError } = await supabase
         .from('generation_references')
         .insert({
-          task_id: '00000000-0000-0000-0000-000000000000',
+          task_id: null,
           user_id: auth.userId,
           object_key: maskObjectKey,
           original_filename: maskFile?.name || 'mask.png',
@@ -464,6 +371,9 @@ export async function POST(request: NextRequest) {
         })
         .select('id')
         .single();
+      if (maskRefError || !maskRef) {
+        throw new AppError(ErrorCodes.INTERNAL_ERROR, 'Failed to store mask provenance');
+      }
       if (maskRef) referenceAssetIds.push(maskRef.id);
     }
 
@@ -485,21 +395,15 @@ export async function POST(request: NextRequest) {
         mask_image_dims: maskDims,
         reference_image_count: referenceBuffers.length,
         reference_image_keys: referenceObjectKeys,
+        reference_asset_ids: referenceAssetIds,
         has_mask: !!maskBuffer,
         response_format: responseFormat,
       },
       reference_asset_ids: referenceAssetIds.length > 0 ? referenceAssetIds : undefined,
       custom_headers: forwardHeaders,
       requestSource: auth.authMethod === 'apikey' ? 'api' : 'web',
+      api_key_id: auth.apiKeyId,
     });
-
-    // Update the placeholder task_id on references
-    for (const refId of referenceAssetIds) {
-      await supabase
-        .from('generation_references')
-        .update({ task_id: task.id })
-        .eq('id', refId);
-    }
 
     // ── Execute synchronously (OpenAI-compatible) ─────────────────────
     const timeoutMs = (modelConfig.timeout_seconds || 120) * 1000;
@@ -550,26 +454,7 @@ export async function POST(request: NextRequest) {
   } catch (err) {
     // OpenAI-compatible error format
     if (err instanceof AppError) {
-      const statusMap: Record<string, number> = {
-        UNAUTHORIZED: 401,
-        FORBIDDEN: 403,
-        USER_DISABLED: 403,
-        API_DISABLED: 403,
-        GENERATION_DISABLED: 503,
-        INVALID_REQUEST: 400,
-        INVALID_FILE: 400,
-        MODEL_NOT_FOUND: 404,
-        MODEL_NOT_ALLOWED: 403,
-        SIZE_NOT_ALLOWED: 400,
-        QUOTA_EXCEEDED: 429,
-        CONCURRENCY_LIMITED: 429,
-        PROVIDER_TIMEOUT: 504,
-        PROVIDER_ERROR: 502,
-        RATE_LIMITED: 429,
-        API_KEY_INVALID: 401,
-        API_KEY_EXPIRED: 401,
-      };
-      const status = statusMap[err.code] || 500;
+      const status = errorStatusMap[err.code] || 500;
       return NextResponse.json(
         {
           error: {

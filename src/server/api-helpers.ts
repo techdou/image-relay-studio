@@ -30,6 +30,7 @@ export interface AuthResult {
    * currently treated as having full access.
    */
   scopes?: string[];
+  apiKeyId?: string;
 }
 
 export async function authenticateRequest(request: NextRequest): Promise<AuthResult> {
@@ -41,6 +42,7 @@ export async function authenticateRequest(request: NextRequest): Promise<AuthRes
   let userId: string | null = null;
   let authMethod: AuthMethod | null = null;
   let scopes: string[] | undefined = undefined;
+  let apiKeyId: string | undefined;
 
   if (sessionToken) {
     const supabase = getSupabaseServerClient();
@@ -59,6 +61,7 @@ export async function authenticateRequest(request: NextRequest): Promise<AuthRes
           userId = result.user_id;
           authMethod = 'apikey';
           scopes = result.scopes;
+          apiKeyId = result.id;
         }
       } else {
         const supabase = getSupabaseServerClient();
@@ -99,6 +102,32 @@ export async function authenticateRequest(request: NextRequest): Promise<AuthRes
     throw new AppError(ErrorCodes.USER_DISABLED, '账号已被禁用');
   }
 
+  if (authMethod === 'apikey') {
+    const [apiSettingResult, quotaResult] = await Promise.all([
+      supabase
+        .from('system_settings')
+        .select('value')
+        .eq('key', 'api_enabled')
+        .maybeSingle(),
+      supabase
+        .from('user_quotas')
+        .select('api_access_enabled')
+        .eq('user_id', userId)
+        .maybeSingle(),
+    ]);
+
+    // Previously issued keys must stop working immediately when either the
+    // global or per-user switch is disabled. Missing rows/errors fail closed.
+    if (
+      apiSettingResult.error ||
+      apiSettingResult.data?.value !== 'true' ||
+      quotaResult.error ||
+      quotaResult.data?.api_access_enabled !== true
+    ) {
+      throw new AppError(ErrorCodes.API_DISABLED, 'API access is disabled');
+    }
+  }
+
   return {
     userId,
     role: profile.role,
@@ -107,6 +136,7 @@ export async function authenticateRequest(request: NextRequest): Promise<AuthRes
     authMethod,
     // Only attach `scopes` for API-key auth; leave undefined for sessions.
     scopes: authMethod === 'apikey' ? scopes : undefined,
+    apiKeyId: authMethod === 'apikey' ? apiKeyId : undefined,
   };
 }
 

@@ -19,7 +19,7 @@ echo "Retention period: ${RETENTION_DAYS} days"
 echo "Cutoff date: ${CUTOFF_DATE}"
 echo ""
 
-npx tsx -e "
+pnpm exec tsx -e "
 const { getSupabaseServerClient } = require('./src/storage/database/supabase-client');
 
 async function cleanup() {

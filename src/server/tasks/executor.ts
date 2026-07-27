@@ -10,18 +10,13 @@ import { canTransition, type TaskStatus, type TaskType } from './state-machine';
 import { generateWithModel, getModelConfig } from '@/server/providers/images';
 import {
   uploadFile,
+  deleteFile,
   generateSignedUrl,
   assertSafeUrl,
   fetchToBuffer,
   MAX_DOWNLOAD_BYTES,
 } from '@/server/storage';
 import type { ProviderGenerationRequest } from '@/server/providers/images/types';
-
-/**
- * PostgreSQL error code for unique_violation. Returned by Supabase when
- * a UNIQUE constraint (e.g. on (user_id, idempotency_key)) is violated.
- */
-const PG_UNIQUE_VIOLATION = '23505';
 
 /**
  * Narrows an unknown caught value to a PostgREST/Postgres-style error
@@ -34,24 +29,6 @@ function isPostgresLikeError(err: unknown): err is { code: string; message: stri
   return (
     (typeof obj.code === 'string' || obj.code === undefined) &&
     (typeof obj.message === 'string' || obj.message === undefined)
-  );
-}
-
-/**
- * Inspects an unknown caught error and decides whether it represents a
- * Postgres unique_violation (23505) — either via the structured `code`
- * field or via substring matches on `message` (Supabase wraps 23505 in
- * both shapes depending on whether it came through .single() or not).
- */
-function isUniqueViolationError(err: unknown): boolean {
-  if (!isPostgresLikeError(err)) return false;
-  const code = err.code ?? '';
-  const message = (err.message ?? '').toLowerCase();
-  return (
-    code === PG_UNIQUE_VIOLATION ||
-    message.includes(PG_UNIQUE_VIOLATION) ||
-    message.includes('duplicate') ||
-    message.includes('unique')
   );
 }
 
@@ -70,6 +47,7 @@ export interface CreateTaskParams {
   idempotency_key?: string;
   reference_asset_ids?: string[];
   custom_headers?: Record<string, string>;
+  api_key_id?: string;
   /**
    * Origin of the request. Stored on usage_records.request_source.
    * Defaults to 'web'. Do NOT infer from custom_headers (those can be
@@ -106,117 +84,75 @@ export interface GenerationTask {
 
 export async function createTask(params: CreateTaskParams): Promise<GenerationTask> {
   const client = getSupabaseClient();
-
-  // Fast path: most idempotent requests are first-time, so we still try
-  // a select-then-insert. The race window is closed by the unique
-  // constraint at the DB layer; we additionally catch the 23505
-  // violation below to recover gracefully on collision.
-  if (params.idempotency_key) {
-    const { data: existing } = await client
-      .from('generation_tasks')
-      .select('*')
-      .eq('user_id', params.user_id)
-      .eq('idempotency_key', params.idempotency_key)
-      .is('deleted_at', null)
-      .limit(1);
-
-    if (existing && existing.length > 0) {
-      return existing[0] as unknown as GenerationTask;
-    }
-  }
-
   const modelConfig = await getModelConfig(params.model_code);
-
-  let data: unknown = null;
-  try {
-    const insertResult = await client
-      .from('generation_tasks')
-      .insert({
-        user_id: params.user_id,
-        model_config_id: modelConfig.id,
-        task_type: params.task_type,
-        status: 'queued',
-        prompt: params.prompt,
-        request_parameters: params.request_parameters || {},
-        idempotency_key: params.idempotency_key || null,
-        attempt_count: 0,
-      })
-      .select()
-      .single();
-    if (insertResult.error || !insertResult.data) {
-      throw insertResult.error ?? new Error('insert returned no data');
-    }
-    data = insertResult.data;
-  } catch (err: unknown) {
-    // 23505 = unique_violation. If the (user_id, idempotency_key) row
-    // was inserted by a concurrent request between our SELECT and
-    // INSERT, fall back to returning that existing row.
-    const isUniqueViolation = isUniqueViolationError(err);
-
-    if (params.idempotency_key && isUniqueViolation) {
-      logger.warn('Idempotency conflict on insert, returning existing task', {
-        user_id: params.user_id,
-        idempotency_key: params.idempotency_key,
-        action: 'create_task_idempotency_conflict',
-      });
-      const { data: existing } = await client
-        .from('generation_tasks')
-        .select('*')
-        .eq('user_id', params.user_id)
-        .eq('idempotency_key', params.idempotency_key)
-        .is('deleted_at', null)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .single();
-
-      if (existing) {
-        return existing as unknown as GenerationTask;
-      }
-    }
-
-    logger.error('Failed to create task', {
-      error: errorMessageOf(err),
-      user_id: params.user_id,
-    });
-    throw new AppError(
-      isUniqueViolation ? ErrorCodes.IDEMPOTENCY_CONFLICT : ErrorCodes.INTERNAL_ERROR,
-      'Failed to create generation task'
-    );
-  }
-
-  const task = data as { id: string };
-
-  // Create usage record. request_source is taken from the explicit
-  // params field — never inferred from custom_headers (which can be
-  // spoofed by clients).
   const requestSource: 'api' | 'web' = params.requestSource ?? 'web';
-  try {
-    await client.from('usage_records').insert({
-      user_id: params.user_id,
-      task_id: task.id,
-      model_config_id: modelConfig.id,
-      request_source: requestSource,
-      requested_image_count: (params.request_parameters?.n as number) || 1,
-      status: 'queued',
-    });
-  } catch (usageErr: unknown) {
-    // If the usage record insert fails (e.g. unique violation from a
-    // concurrent duplicate), do not fail the whole create. The task row
-    // already exists; downstream code will still see status='queued'.
-    logger.error('Failed to create usage record', {
-      task_id: task.id,
-      error: errorMessageOf(usageErr),
-    });
+  const requestedCount = Number(params.request_parameters?.n ?? 1);
+
+  // Ensure a quota row exists before entering the reservation transaction.
+  // ignoreDuplicates makes concurrent first requests safe.
+  const { error: quotaInitError } = await client
+    .from('user_quotas')
+    .upsert(
+      { user_id: params.user_id },
+      { onConflict: 'user_id', ignoreDuplicates: true }
+    );
+  if (quotaInitError) {
+    throw new AppError(ErrorCodes.INTERNAL_ERROR, 'Failed to initialize user quota');
   }
+
+  const { data: reservation, error: reservationError } = await client.rpc(
+    'reserve_generation_task',
+    {
+      p_user_id: params.user_id,
+      p_model_config_id: modelConfig.id,
+      p_task_type: params.task_type,
+      p_prompt: params.prompt,
+      p_request_parameters: params.request_parameters || {},
+      p_idempotency_key: params.idempotency_key || null,
+      p_request_source: requestSource,
+      p_requested_count: requestedCount,
+      p_api_key_id: params.api_key_id || null,
+    }
+  );
+
+  if (reservationError || !reservation) {
+    const message = reservationError?.message || 'Task reservation returned no data';
+    if (message.includes('IRS_DAILY_QUOTA_EXCEEDED')) {
+      throw new AppError(ErrorCodes.QUOTA_EXCEEDED, 'Daily image generation quota exceeded');
+    }
+    if (message.includes('IRS_MONTHLY_QUOTA_EXCEEDED')) {
+      throw new AppError(ErrorCodes.QUOTA_EXCEEDED, 'Monthly image generation quota exceeded');
+    }
+    if (message.includes('IRS_CONCURRENCY_LIMITED')) {
+      throw new AppError(ErrorCodes.CONCURRENCY_LIMITED, 'Maximum concurrent tasks reached');
+    }
+    if (message.includes('IRS_MODEL_DISABLED')) {
+      throw new AppError(ErrorCodes.MODEL_DISABLED, 'Model is disabled');
+    }
+    logger.error('Failed to reserve generation task', {
+      error: message,
+      user_id: params.user_id,
+    });
+    throw new AppError(ErrorCodes.INTERNAL_ERROR, 'Failed to create generation task');
+  }
+
+  const result = reservation as unknown as {
+    created: boolean;
+    task: GenerationTask;
+  };
+  const task = result.task;
 
   // Link pre-uploaded reference assets to this task
-  if (params.reference_asset_ids && params.reference_asset_ids.length > 0) {
-    await client
+  if (result.created && params.reference_asset_ids && params.reference_asset_ids.length > 0) {
+    const { error: referenceLinkError } = await client
       .from('generation_references')
       .update({ task_id: task.id })
       .in('id', params.reference_asset_ids)
       .eq('user_id', params.user_id)
       .is('task_id', null);
+    if (referenceLinkError) {
+      throw new AppError(ErrorCodes.INTERNAL_ERROR, 'Failed to link generation references');
+    }
   }
 
   logger.info('Task created', {
@@ -224,10 +160,11 @@ export async function createTask(params: CreateTaskParams): Promise<GenerationTa
     user_id: params.user_id,
     model_code: params.model_code,
     request_source: requestSource,
+    idempotent_replay: !result.created,
     action: 'create_task',
   });
 
-  return data as unknown as GenerationTask;
+  return task;
 }
 
 export async function executeTask(taskId: string, customHeaders?: Record<string, string>, directReferenceUrls?: string[]): Promise<void> {
@@ -250,39 +187,66 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
     return;
   }
 
-  // Optimistic lock: only this worker can flip queued -> running.
-  // If another worker already claimed the task (or it was cancelled),
-  // the conditional update matches 0 rows and we bail out to avoid
-  // duplicate execution / double-billing.
   const startTime = Date.now();
-  const { data: claimed, count } = await client
-    .from('generation_tasks')
-    .update({
-      status: 'running',
-      started_at: new Date().toISOString(),
-      attempt_count: task.attempt_count + 1,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', taskId)
-    .eq('status', 'queued')
-    .select();
+  let modelCode: string;
+  let modelConfig: Awaited<ReturnType<typeof getModelConfig>>;
+  try {
+    modelCode = await getTaskModelCode(task.model_config_id);
+    modelConfig = await getModelConfig(modelCode);
+  } catch (error) {
+    await markQueuedTaskFailed(
+      taskId,
+      error instanceof AppError ? error.code : ErrorCodes.MODEL_NOT_FOUND,
+      errorMessageOf(error),
+      Date.now() - startTime
+    );
+    return;
+  }
+  const queueDeadline = Date.now() + Math.max(30_000, modelConfig.timeout_seconds * 1000);
+  let claimed = false;
 
-  if (!claimed || claimed.length === 0) {
-    logger.warn('Task already claimed or no longer queued', {
-      task_id: taskId,
-      status: task.status,
-      count: count ?? 0,
-      action: 'execute_task_skipped',
+  // The RPC serializes claims per model in Postgres, so
+  // max_provider_concurrency is enforced across all application instances.
+  while (Date.now() < queueDeadline) {
+    const { data, error } = await client.rpc('claim_generation_task', {
+      p_task_id: taskId,
     });
+    if (error) {
+      await markQueuedTaskFailed(
+        taskId,
+        ErrorCodes.INTERNAL_ERROR,
+        'Failed to claim provider execution slot',
+        Date.now() - startTime
+      );
+      return;
+    }
+    if (data === true) {
+      claimed = true;
+      break;
+    }
+
+    const { data: latest } = await client
+      .from('generation_tasks')
+      .select('status')
+      .eq('id', taskId)
+      .single();
+    if (!latest || latest.status !== 'queued') {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+
+  if (!claimed) {
+    await markQueuedTaskFailed(
+      taskId,
+      ErrorCodes.PROVIDER_TIMEOUT,
+      'Timed out waiting for provider concurrency slot',
+      Date.now() - startTime
+    );
     return;
   }
 
   try {
-    // Get model config
-    const modelConfig = await getModelConfig(
-      await getTaskModelCode(task.model_config_id)
-    );
-
     // Get reference image URLs for provider
     // Priority: 1) directReferenceUrls (from edits endpoint), 2) stored in request_parameters,
     // 3) from generation_references via object storage
@@ -327,6 +291,14 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
       }
     }
 
+    const requestedCount = Number(task.request_parameters?.n ?? 1);
+    if (requestedCount > 1 && !modelConfig.supports_sequential_generation) {
+      throw new AppError(
+        ErrorCodes.INVALID_REQUEST,
+        'Model no longer supports multiple images per request'
+      );
+    }
+
     // Build provider request
     const providerRequest: ProviderGenerationRequest = {
       prompt: task.prompt,
@@ -334,23 +306,36 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
       size: (task.request_parameters?.size as string) || '2K',
       watermark: task.request_parameters?.visible_watermark as boolean ?? false,
       reference_image_urls: referenceUrls.length > 0 ? referenceUrls : undefined,
+      sequential_generation: requestedCount > 1 ? 'auto' : 'disabled',
+      sequential_max_images: requestedCount,
       custom_headers: customHeaders,
     };
 
     // Call provider
     const result = await generateWithModel(
-      await getTaskModelCode(task.model_config_id),
+      modelCode,
       providerRequest
     );
 
     const latencyMs = Date.now() - startTime;
 
     if (result.success) {
+      const providerOutputs = [
+        ...result.image_urls,
+        ...result.image_b64_list,
+      ].slice(0, requestedCount);
+
+      if (providerOutputs.length < requestedCount) {
+        throw new AppError(
+          ErrorCodes.PROVIDER_ERROR,
+          `Provider returned ${providerOutputs.length} of ${requestedCount} requested images`
+        );
+      }
+
       // Persist generated images to object storage
       let generatedCount = 0;
-      for (const [idx, urlOrB64] of (result.image_urls.length > 0
-        ? result.image_urls.map((url, i) => [i, url] as [number, string])
-        : result.image_b64_list.map((b64, i) => [i, b64] as [number, string]))) {
+      const persistedObjectKeys: string[] = [];
+      for (const [idx, urlOrB64] of providerOutputs.entries()) {
 
         try {
           let objectKey: string;
@@ -373,7 +358,7 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
           }
 
           // Create asset record
-          await client.from('generation_assets').insert({
+          const { error: assetInsertError } = await client.from('generation_assets').insert({
             task_id: taskId,
             user_id: task.user_id,
             object_key: objectKey,
@@ -382,7 +367,12 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
             visible_watermark_disabled: !(task.request_parameters?.visible_watermark as boolean ?? false),
             favorite: false,
           });
+          if (assetInsertError) {
+            await deleteFile(objectKey).catch(() => false);
+            throw assetInsertError;
+          }
 
+          persistedObjectKeys.push(objectKey);
           generatedCount++;
         } catch (assetError) {
           logger.error('Failed to persist generated asset', {
@@ -391,6 +381,14 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
             error: assetError instanceof Error ? assetError.message : 'Unknown',
           });
         }
+      }
+
+      if (generatedCount !== requestedCount) {
+        await cleanupTaskAssets(taskId, persistedObjectKeys);
+        throw new AppError(
+          ErrorCodes.STORAGE_ERROR,
+          `Persisted ${generatedCount} of ${requestedCount} generated images`
+        );
       }
 
       // Optimistic lock on running -> succeeded. If a parallel worker
@@ -410,7 +408,7 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
 
       if (succeeded && succeeded.length > 0) {
         // Update usage record
-        await client
+        const { error: usageUpdateError } = await client
           .from('usage_records')
           .update({
             generated_image_count: generatedCount,
@@ -418,6 +416,12 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
             latency_ms: latencyMs,
           })
           .eq('task_id', taskId);
+        if (usageUpdateError) {
+          logger.error('Failed to finalize usage record', {
+            task_id: taskId,
+            error: usageUpdateError.message,
+          });
+        }
 
         logger.info('Task completed successfully', {
           task_id: taskId,
@@ -426,6 +430,7 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
           action: 'task_succeeded',
         });
       } else {
+        await cleanupTaskAssets(taskId, persistedObjectKeys);
         logger.warn('Task succeeded update skipped (status changed concurrently)', {
           task_id: taskId,
           action: 'task_succeeded_skipped',
@@ -442,6 +447,21 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
     const errorMsg = error instanceof Error ? error.message : 'Unknown provider error';
     await markTaskFailed(taskId, errorCode, errorMsg, latencyMs);
   }
+}
+
+async function cleanupTaskAssets(taskId: string, objectKeys: string[]): Promise<void> {
+  const client = getSupabaseClient();
+  const { error } = await client
+    .from('generation_assets')
+    .delete()
+    .eq('task_id', taskId);
+  if (error) {
+    logger.error('Failed to remove partial asset records', {
+      task_id: taskId,
+      error: error.message,
+    });
+  }
+  await Promise.allSettled(objectKeys.map((key) => deleteFile(key)));
 }
 
 /**
@@ -486,7 +506,7 @@ async function markTaskFailed(
     is_retryable: retryable,
   });
 
-  const { data: updated } = await client
+  const { data: updated, error: taskUpdateError } = await client
     .from('generation_tasks')
     .update({
       status: 'failed',
@@ -500,6 +520,14 @@ async function markTaskFailed(
     .eq('status', 'running')
     .select();
 
+  if (taskUpdateError) {
+    logger.error('Failed to mark task as failed', {
+      task_id: taskId,
+      error: taskUpdateError.message,
+    });
+    return;
+  }
+
   if (!updated || updated.length === 0) {
     logger.warn('Task failed update skipped (status changed concurrently)', {
       task_id: taskId,
@@ -509,13 +537,19 @@ async function markTaskFailed(
     return;
   }
 
-  await client
+  const { error: usageUpdateError } = await client
     .from('usage_records')
     .update({
       status: 'failed',
       latency_ms: latencyMs,
     })
     .eq('task_id', taskId);
+  if (usageUpdateError) {
+    logger.error('Failed to mark usage record as failed', {
+      task_id: taskId,
+      error: usageUpdateError.message,
+    });
+  }
 
   logger.error('Task failed', {
     task_id: taskId,
@@ -524,6 +558,51 @@ async function markTaskFailed(
     is_retryable: retryable,
     action: 'task_failed',
   });
+}
+
+async function markQueuedTaskFailed(
+  taskId: string,
+  errorCode: ErrorCode,
+  errorMessage: string,
+  latencyMs: number
+): Promise<void> {
+  const client = getSupabaseClient();
+  const { data, error } = await client
+    .from('generation_tasks')
+    .update({
+      status: 'failed',
+      completed_at: new Date().toISOString(),
+      error_code: errorCode,
+      error_message: JSON.stringify({
+        message: errorMessage,
+        code: errorCode,
+        is_retryable: isRetryableProviderError(errorCode),
+      }),
+      latency_ms: latencyMs,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('id', taskId)
+    .eq('status', 'queued')
+    .select('id');
+
+  if (error || !data || data.length === 0) {
+    logger.warn('Queued task failure update was skipped', {
+      task_id: taskId,
+      error: error?.message,
+    });
+    return;
+  }
+
+  const { error: usageError } = await client
+    .from('usage_records')
+    .update({ status: 'failed', latency_ms: latencyMs })
+    .eq('task_id', taskId);
+  if (usageError) {
+    logger.error('Failed to release queued usage reservation', {
+      task_id: taskId,
+      error: usageError.message,
+    });
+  }
 }
 
 async function getTaskModelCode(modelConfigId: string): Promise<string> {
@@ -678,33 +757,23 @@ export async function executeTaskSync(
 
 export async function cancelTask(taskId: string, userId: string, isAdmin: boolean): Promise<void> {
   const client = getSupabaseClient();
-  const task = await getTask(taskId, userId, isAdmin);
-  if (!task) throw new AppError(ErrorCodes.TASK_NOT_FOUND, 'Task not found');
-
-  if (!canTransition(task.status, 'cancelled')) {
-    throw new AppError(ErrorCodes.INVALID_TASK_STATE, `Cannot cancel task in ${task.status} state`);
-  }
-
-  // Optimistic lock: cancel only succeeds if the task is still in the
-  // status we read. A worker that just flipped it to 'running' or a
-  // parallel cancel request will cause this update to affect 0 rows,
-  // in which case we report the current state to the caller.
-  const { data: cancelled } = await client
-    .from('generation_tasks')
-    .update({
-      status: 'cancelled',
-      cancelled_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', taskId)
-    .eq('status', task.status)
-    .select();
-
-  if (!cancelled || cancelled.length === 0) {
-    throw new AppError(
-      ErrorCodes.INVALID_TASK_STATE,
-      `Task was no longer in ${task.status} state (likely changed concurrently); cancellation aborted.`
-    );
+  const { data, error } = await client.rpc('cancel_generation_task', {
+    p_task_id: taskId,
+    p_actor_user_id: userId,
+    p_is_admin: isAdmin,
+  });
+  if (error || data !== true) {
+    const message = error?.message || '';
+    if (message.includes('IRS_TASK_NOT_FOUND')) {
+      throw new AppError(ErrorCodes.TASK_NOT_FOUND, 'Task not found');
+    }
+    if (message.includes('IRS_FORBIDDEN')) {
+      throw new AppError(ErrorCodes.FORBIDDEN, 'Cannot cancel another user\'s task');
+    }
+    if (message.includes('IRS_INVALID_TASK_STATE')) {
+      throw new AppError(ErrorCodes.INVALID_TASK_STATE, 'Task cannot be cancelled in its current state');
+    }
+    throw new AppError(ErrorCodes.INTERNAL_ERROR, 'Failed to cancel task');
   }
 }
 
@@ -717,44 +786,36 @@ export async function retryTask(taskId: string, userId: string, isAdmin: boolean
     throw new AppError(ErrorCodes.INVALID_TASK_STATE, 'Only failed tasks can be retried');
   }
 
-  if (!canTransition('failed', 'queued')) {
-    throw new AppError(ErrorCodes.INVALID_TASK_STATE, 'Task cannot be retried');
+  const nonRetryableCodes = new Set<ErrorCode>([
+    ErrorCodes.INVALID_REQUEST,
+    ErrorCodes.MODEL_NOT_FOUND,
+    ErrorCodes.MODEL_NOT_ALLOWED,
+    ErrorCodes.SIZE_NOT_ALLOWED,
+    ErrorCodes.QUOTA_EXCEEDED,
+    ErrorCodes.INVALID_FILE,
+  ]);
+  if (task.error_code && nonRetryableCodes.has(task.error_code as ErrorCode)) {
+    throw new AppError(ErrorCodes.INVALID_TASK_STATE, 'This failure is not retryable');
   }
 
-  // Optimistic lock: only retry if still failed (prevents double-retry
-  // when the user double-clicks).
-  const { data: queued } = await client
-    .from('generation_tasks')
-    .update({
-      status: 'queued',
-      error_code: null,
-      error_message: null,
-      error_details: null,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', taskId)
-    .eq('status', 'failed')
-    .select();
-
-  if (!queued || queued.length === 0) {
-    throw new AppError(
-      ErrorCodes.INVALID_TASK_STATE,
-      'Task was no longer in failed state (likely retried concurrently); retry aborted.'
-    );
+  const { data: queued, error } = await client.rpc('retry_generation_task', {
+    p_task_id: taskId,
+    p_actor_user_id: userId,
+    p_is_admin: isAdmin,
+  });
+  if (error || !queued) {
+    const message = error?.message || '';
+    if (message.includes('IRS_DAILY_QUOTA_EXCEEDED') || message.includes('IRS_MONTHLY_QUOTA_EXCEEDED')) {
+      throw new AppError(ErrorCodes.QUOTA_EXCEEDED, 'Image generation quota exceeded');
+    }
+    if (message.includes('IRS_CONCURRENCY_LIMITED')) {
+      throw new AppError(ErrorCodes.CONCURRENCY_LIMITED, 'Maximum concurrent tasks reached');
+    }
+    if (message.includes('IRS_INVALID_TASK_STATE')) {
+      throw new AppError(ErrorCodes.INVALID_TASK_STATE, 'Task is no longer retryable');
+    }
+    throw new AppError(ErrorCodes.INTERNAL_ERROR, 'Failed to retry task');
   }
-
-  // Sync the usage_records row back to 'queued' so that quota counters
-  // (which count queued/running/succeeded) treat this slot as active
-  // again. Without this, a failed-then-retried task would be counted
-  // twice in the daily/monthly totals (once as failed-but-ignored, once
-  // for the new run), or zero times if the failed row had been excluded.
-  await client
-    .from('usage_records')
-    .update({
-      status: 'queued',
-      updated_at: new Date().toISOString(),
-    })
-    .eq('task_id', taskId);
 
   // Execute immediately (inline executor)
   executeTask(taskId).catch((err) => {
@@ -764,11 +825,5 @@ export async function retryTask(taskId: string, userId: string, isAdmin: boolean
     });
   });
 
-  const { data } = await client
-    .from('generation_tasks')
-    .select('*')
-    .eq('id', taskId)
-    .single();
-
-  return data as unknown as GenerationTask;
+  return queued as unknown as GenerationTask;
 }

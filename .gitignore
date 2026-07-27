@@ -1,171 +1,139 @@
-# ===========================================
-# Image Relay Studio - .gitignore
-# ===========================================
-# 原则：私密信息与 API 密钥绝不入库；开发软件配置目录不上传。
+# Image Relay Studio
+# 原则：真实凭据、个人开发工具配置、依赖、缓存和构建产物不得进入版本库。
 
-# ---------- 依赖 ----------
-node_modules/
+# 依赖与包管理器缓存
+/node_modules/
+/.pnpm-store/
 .pnp
 .pnp.*
-.pnp.js
-.yarn/cache
-.yarn/unplugged
-.yarn/build-state.yml
-.yarn/install-state.gz
+/.yarn/
 
-# ---------- 构建产物 ----------
-.next/
-.nuxt/
-.turbo/
-.vercel/
-dist/
-build/
-out/
-.rsbuild/
-.parcel-cache/
-.cache/
-.storybook/
-storybook-static/
-coverage/
+# 构建、测试与分析产物
+/.next/
+/dist/
+/build/
+/out/
+/.turbo/
+/.cache/
+/.parcel-cache/
+/.rsbuild/
+/coverage/
+/.nyc_output/
+/playwright-report/
+/test-results/
+/storybook-static/
 *.lcov
-.nyc_output/
 *.tsbuildinfo
 
-# ---------- 环境变量 / 密钥（核心红线） ----------
-# 任何含真实密钥的 env 文件一律忽略；只提交 .env.example 这类空模板
+# 环境变量与本地配置
+# 只允许提交不含真实值的示例文件。
 .env
 .env.*
 !.env.example
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
+!.env.*.example
+*.local
+config.local.*
 
-# 私钥 / 证书 / 服务账号
+# 密钥、证书、服务账号和凭据
 *.pem
 *.key
-*.crt
 *.p12
 *.pfx
+*.jks
+*.keystore
+*.kdbx
+*.ovpn
 service-account*.json
+credentials*.json
 secrets.*
-credentials.*
+/.secrets/
+/secrets/
+/.aws/
+/.azure/
+/.gcloud/
+/.kube/
 
-# ---------- 开发软件配置（不上传原则） ----------
-# 编辑器 / IDE 个人配置（保留共享的 extensions.json 例外）
-.vscode/*
-!.vscode/extensions.json
-.idea/
+# 编辑器、IDE 与 AI 开发工具的个人配置
+/.vscode/
+/.idea/
+/.fleet/
+/.zed/
+/.history/
+/.cursor/
+/.claude/
+/.codex/
+/.agents/
+/.windsurf/
+/.continue/
+/.aider*
 *.iml
 *.suo
 *.ntvs*
 *.njsproj
 *.sln
 *.sw?
-*.swo
 *~
 
-# 操作系统
-.DS_Store
-._*
-.DS_Store?
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-ehthumbs_vista.db
-Thumbs.db
-Desktop.ini
+# 平台本地状态
+# `.coze` 是项目运行清单，需要保留；这里只忽略本地缓存与日志。
+/.vercel/
+/.netlify/
+/.supabase/
+/supabase/.branches/
+/supabase/.temp/
+/.cozeproj/
+/.coze-logs
+/.codegraph/
+/.codegraph
 
-# 工具缓存
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.tox/
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-.eslintcache
-.stylelintcache
-.node_react/
-.pnpm-store/
-
-# ---------- 项目本地调试素材（不入库） ----------
-# assets/ 存放本地调试素材与个人截图，不进版本库
+# 本地调试素材和个人脚本
+# 可发布静态资源应放入 public/。
 /assets/
-# 个人本地脚本/数据
 /scripts/local/
-# 预览与图索引
-.preview
-.codegraph/
-.codegraph
-.coze-logs
-.cozeproj/reduction
+/.preview
 
-# ---------- 日志 ----------
+# 日志、进程与临时文件
 *.log
 *.log.*
-logs/
-output.log
+/logs/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
-
-# ---------- 运行时 ----------
-pids
 *.pid
-*.seed
 *.pid.lock
-report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+*.seed
 *.tmp
 *.temp
-.tmp/
-.temp/
+/.tmp/
+/.temp/
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
-# ---------- 大文件 / 二进制媒体 ----------
-# 视频与归档不进版本库，避免仓库膨胀；如需分发请走 release 附件或外部存储
-*.mp4
-*.avi
-*.mov
-*.wmv
-*.flv
-*.mkv
-*.webm
-*.m4v
-*.mpeg
-*.mpg
-*.3gp
-*.f4v
-*.rmvb
-*.vob
+# Python/辅助工具缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+/.venv/
+/venv/
+/.pytest_cache/
+/.mypy_cache/
+/.ruff_cache/
+/.tox/
+/.eslintcache
+/.stylelintcache
 
-*.iso
-*.dmg
-*.rar
-*.zip
-*.gz
-*.tar
-*.tgz
+# 操作系统文件
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
 
-# 文档类二进制（默认排除，个别需要的用 git add -f 强加）
-*.pdf
-*.docx
-*.doc
-*.xlsx
-*.xls
-*.ppt
-*.pptx
-*.csv
-
-# ---------- 其他 ----------
-/vendor
-bin/
-*.test
-*.o
-*.a
-*.swp
-pids/
-.optional-files
+# 其他本地产物
+/vendor/
+/bin/
+/.optional-files

@@ -12,17 +12,29 @@ import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { createStorageClient } from '@/server/storage';
 import { createTask, executeTask } from '@/server/tasks/executor';
 import type { TaskType } from '@/server/tasks/state-machine';
+import {
+  createGenerationTaskSchema,
+  imageListQuerySchema,
+  parseInput,
+} from '@/server/validation/schemas';
 
 export async function GET(request: NextRequest) {
   try {
     const auth = await authenticateRequest(request);
+    requireScope(auth, 'images:read');
     const supabase = getSupabaseClient();
 
     const url = new URL(request.url);
-    const page = parseInt(url.searchParams.get('page') || '1');
-    const pageSize = parseInt(url.searchParams.get('page_size') || '24');
-    const favorite = url.searchParams.get('favorite');
-    const taskId = url.searchParams.get('task_id');
+    const queryParams = parseInput(
+      imageListQuerySchema,
+      Object.fromEntries(url.searchParams.entries())
+    );
+    const {
+      page,
+      page_size: pageSize,
+      favorite,
+      task_id: taskId,
+    } = queryParams;
 
     let query = supabase
       .from('generation_assets')
@@ -70,12 +82,16 @@ export async function POST(request: NextRequest) {
     requireScope(auth, 'images:write');
     enforceGenerationRateLimit(auth.userId);
 
-    const body = await request.json();
-    const { model: modelCode, prompt, size = '1024x1024', n = 1, visible_watermark = false, reference_asset_ids = [], idempotency_key } = body;
-
-    if (!modelCode || !prompt) {
-      throw new AppError(ErrorCodes.INVALID_REQUEST, '缺少必要参数 model 和 prompt');
-    }
+    const body = parseInput(createGenerationTaskSchema, await request.json());
+    const {
+      model: modelCode,
+      prompt,
+      size,
+      n,
+      visible_watermark,
+      reference_asset_ids,
+      idempotency_key,
+    } = body;
 
     const supabase = getSupabaseClient();
 
@@ -135,64 +151,6 @@ export async function POST(request: NextRequest) {
       throw new AppError(ErrorCodes.INVALID_REQUEST, '图片数量超出限制');
     }
 
-    // 7. Check daily quota
-    const today = new Date().toISOString().split('T')[0];
-    const { count: dailyUsed } = await supabase
-      .from('usage_records')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', auth.userId)
-      .gte('created_at', today);
-
-    const dailyLimit = quota?.daily_image_limit || 50;
-    if ((dailyUsed || 0) >= dailyLimit) {
-      throw new AppError(ErrorCodes.QUOTA_EXCEEDED, '今日生成额度已用完');
-    }
-
-    // 8. Check monthly quota
-    const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1).toISOString();
-    const { count: monthlyUsed } = await supabase
-      .from('usage_records')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', auth.userId)
-      .gte('created_at', monthStart);
-
-    const monthlyLimit = quota?.monthly_image_limit || 500;
-    if ((monthlyUsed || 0) >= monthlyLimit) {
-      throw new AppError(ErrorCodes.QUOTA_EXCEEDED, '本月生成额度已用完');
-    }
-
-    // 9. Check concurrent tasks
-    const maxConcurrent = quota?.max_concurrent_tasks || 3;
-    const { count: concurrentCount } = await supabase
-      .from('generation_tasks')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', auth.userId)
-      .in('status', ['queued', 'running']);
-
-    if ((concurrentCount || 0) >= maxConcurrent) {
-      throw new AppError(ErrorCodes.CONCURRENCY_LIMITED, '并发任务数已达上限');
-    }
-
-    // 10. Check idempotency
-    if (idempotency_key) {
-      const { data: existingTask } = await supabase
-        .from('generation_tasks')
-        .select('id, status, created_at')
-        .eq('user_id', auth.userId)
-        .eq('idempotency_key', idempotency_key)
-        .gte('created_at', new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString())
-        .single();
-
-      if (existingTask) {
-        return successResponse({
-          task_id: existingTask.id,
-          status: existingTask.status,
-          created_at: existingTask.created_at,
-          status_url: `/api/v1/tasks/${existingTask.id}`,
-        }, auth.requestId, 200);
-      }
-    }
-
     // Determine task type
     const taskType: TaskType = reference_asset_ids?.length > 0 ? 'image_to_image' : 'text_to_image';
 
@@ -202,6 +160,9 @@ export async function POST(request: NextRequest) {
 
     if (visible_watermark && !modelConfig.supports_visible_watermark_control) {
       throw new AppError(ErrorCodes.INVALID_REQUEST, '此模型不支持关闭可见水印');
+    }
+    if (n > 1 && !modelConfig.supports_sequential_generation) {
+      throw new AppError(ErrorCodes.INVALID_REQUEST, '此模型不支持一次生成多张图片');
     }
 
     // Create task via executor
@@ -214,6 +175,7 @@ export async function POST(request: NextRequest) {
       idempotency_key: idempotency_key || undefined,
       reference_asset_ids: reference_asset_ids?.length > 0 ? reference_asset_ids : undefined,
       requestSource: auth.authMethod === 'apikey' ? 'api' : 'web',
+      api_key_id: auth.apiKeyId,
     });
 
     // Execute task asynchronously

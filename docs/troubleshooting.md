@@ -27,7 +27,7 @@
    ```bash
    # 使用线上 API 返回的 URL 和 Anon Key 创建客户端
    # 先用旧密码登录，再更新密码
-   npx tsx -e "
+   pnpm exec tsx -e "
    import { createClient } from '@supabase/supabase-js';
    const supabase = createClient('线上URL', '线上AnonKey');
    const { data } = await supabase.auth.signInWithPassword({

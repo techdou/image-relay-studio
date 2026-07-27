@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 
 export async function GET() {
-  const checks: Record<string, { status: string; latency_ms?: number; error?: string }> = {};
+  const checks: Record<string, { status: string; latency_ms?: number }> = {};
   let overallStatus = 'healthy';
 
   // Database check
@@ -13,11 +13,10 @@ export async function GET() {
     checks.database = {
       status: error ? 'unhealthy' : 'healthy',
       latency_ms: Date.now() - dbStart,
-      ...(error ? { error: error.message } : {}),
     };
     if (error) overallStatus = 'degraded';
-  } catch (err) {
-    checks.database = { status: 'unhealthy', error: err instanceof Error ? err.message : 'Unknown' };
+  } catch {
+    checks.database = { status: 'unhealthy' };
     overallStatus = 'degraded';
   }
 
@@ -31,8 +30,8 @@ export async function GET() {
       status: 'healthy',
       latency_ms: Date.now() - storageStart,
     };
-  } catch (err) {
-    checks.storage = { status: 'unhealthy', error: err instanceof Error ? err.message : 'Unknown' };
+  } catch {
+    checks.storage = { status: 'unhealthy' };
     overallStatus = 'degraded';
   }
 

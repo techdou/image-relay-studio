@@ -90,10 +90,13 @@ export async function revokeApiKey(keyId: string, userId: string): Promise<void>
     throw new AppError(ErrorCodes.FORBIDDEN, 'Cannot revoke another user\'s API key');
   }
 
-  await client
+  const { error: revokeError } = await client
     .from('api_keys')
     .update({ revoked_at: new Date().toISOString() })
     .eq('id', keyId);
+  if (revokeError) {
+    throw new AppError(ErrorCodes.INTERNAL_ERROR, 'Failed to revoke API key');
+  }
 
   logger.info('API key revoked', { key_id: keyId, user_id: userId, action: 'revoke_api_key' });
 }
@@ -196,7 +199,14 @@ export async function validateApiKey(rawKey: string): Promise<ApiKeyInfo | null>
     .update({ last_used_at: new Date().toISOString() })
     .eq('id', matchedRow.id)
     .then(
-      () => { /* last_used_at update succeeded — nothing to log */ },
+      ({ error: updateError }) => {
+        if (updateError) {
+          logger.warn('Failed to update api_keys.last_used_at', {
+            key_id: matchedRow?.id,
+            error: updateError.message,
+          });
+        }
+      },
       (err: unknown) => {
         logger.warn('Failed to update api_keys.last_used_at', {
           key_id: matchedRow?.id,

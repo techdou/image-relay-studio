@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server';
 import { authenticateRequest, successResponse, errorResponse, requireScope } from '@/server/api-helpers';
+import { getQuotaUsage } from '@/server/quotas';
 
 export async function GET(request: NextRequest) {
   try {
@@ -18,26 +19,7 @@ export async function GET(request: NextRequest) {
       .eq('user_id', auth.userId)
       .single();
 
-    // Get daily usage
-    const { count: dailyUsed } = await supabase
-      .from('usage_records')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', auth.userId)
-      .gte('created_at', today);
-
-    // Get monthly usage
-    const { count: monthlyUsed } = await supabase
-      .from('usage_records')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', auth.userId)
-      .gte('created_at', monthStart);
-
-    // Get concurrent tasks
-    const { count: concurrentCount } = await supabase
-      .from('generation_tasks')
-      .select('*', { count: 'exact', head: true })
-      .eq('user_id', auth.userId)
-      .in('status', ['queued', 'running']);
+    const quotaUsage = await getQuotaUsage(auth.userId);
 
     // Today stats
     const { data: todayRecords } = await supabase
@@ -107,11 +89,11 @@ export async function GET(request: NextRequest) {
     return successResponse({
       quota: {
         daily_limit: quota?.daily_image_limit || 10,
-        daily_used: dailyUsed || 0,
+        daily_used: quotaUsage.daily_used,
         monthly_limit: quota?.monthly_image_limit || 100,
-        monthly_used: monthlyUsed || 0,
+        monthly_used: quotaUsage.monthly_used,
         max_concurrent: quota?.max_concurrent_tasks || 2,
-        current_concurrent: concurrentCount || 0,
+        current_concurrent: quotaUsage.active_tasks,
       },
       today: {
         total_tasks: todayTotal,

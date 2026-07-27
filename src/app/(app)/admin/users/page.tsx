@@ -170,7 +170,7 @@ export default function AdminUsersPage() {
                     {user.display_name || '-'} · {user.role === 'admin' ? '管理员' : '用户'}
                   </div>
                   <button
-                    onClick={() => toggleUserStatus(user.user_id, user.status)}
+                    onClick={() => toggleUserStatus(user.id, user.status)}
                     className="text-xs text-[var(--color-accent)] hover:underline tap-target"
                   >
                     {user.status === 'active' ? '禁用' : '启用'}
@@ -213,7 +213,7 @@ export default function AdminUsersPage() {
                     </td>
                     <td className="px-4 py-2.5">
                       <button
-                        onClick={() => toggleUserStatus(user.user_id, user.status)}
+                        onClick={() => toggleUserStatus(user.id, user.status)}
                         className="text-xs text-[var(--color-accent)] hover:underline"
                       >
                         {user.status === 'active' ? '禁用' : '启用'}
