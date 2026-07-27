@@ -1,0 +1,241 @@
+@import "tailwindcss";
+
+@theme {
+  /* Background */
+  --color-background: #ffffff;
+  --color-surface: #ffffff;
+  --color-surface-subtle: #f7f7f8;
+  --color-surface-hover: #f0f0f2;
+
+  /* Borders */
+  --color-border: #e4e4e7;
+  --color-border-strong: #d1d1d5;
+
+  /* Text */
+  --color-text: #18181b;
+  --color-text-muted: #71717a;
+  --color-text-subtle: #a1a1aa;
+
+  /* Accent - Deep Indigo (matches DESIGN.md: oklch(0.45 0.15 260)) */
+  --color-accent: oklch(0.45 0.15 260);
+  --color-accent-hover: oklch(0.38 0.15 260);
+  --color-accent-subtle: oklch(0.95 0.02 260);
+
+  /* Semantic */
+  --color-success: #16a34a;
+  --color-success-subtle: #f0fdf4;
+  --color-warning: #d97706;
+  --color-warning-subtle: #fffbeb;
+  --color-destructive: #dc2626;
+  --color-destructive-subtle: #fef2f2;
+
+  /* Radius */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+
+  /* Shadows */
+  --shadow-popover: 0 4px 12px rgba(0, 0, 0, 0.08), 0 1px 3px rgba(0, 0, 0, 0.06);
+  --shadow-focus: 0 0 0 2px rgba(79, 70, 229, 0.3);
+
+  /* Sidebar */
+  --sidebar-width: 240px;
+  --topbar-height: 56px;
+
+  /* Studio */
+  --studio-control-width: 380px;
+}
+
+/* Dark mode */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-background: #09090b;
+    --color-surface: #18181b;
+    --color-surface-subtle: #1f1f23;
+    --color-surface-hover: #27272a;
+
+    --color-border: #2e2e33;
+    --color-border-strong: #3f3f46;
+
+    --color-text: #fafafa;
+    --color-text-muted: #a1a1aa;
+    --color-text-subtle: #71717a;
+
+    --color-accent: oklch(0.6 0.15 260);
+    --color-accent-hover: oklch(0.68 0.15 260);
+    --color-accent-subtle: oklch(0.22 0.05 260);
+
+    --color-success: #22c55e;
+    --color-success-subtle: #052e16;
+    --color-warning: #f59e0b;
+    --color-warning-subtle: #451a03;
+    --color-destructive: #ef4444;
+    --color-destructive-subtle: #450a0a;
+
+    --shadow-popover: 0 4px 12px rgba(0, 0, 0, 0.3), 0 1px 3px rgba(0, 0, 0, 0.2);
+  }
+}
+
+/* Also support explicit dark class */
+.dark {
+  --color-background: #09090b;
+  --color-surface: #18181b;
+  --color-surface-subtle: #1f1f23;
+  --color-surface-hover: #27272a;
+
+  --color-border: #2e2e33;
+  --color-border-strong: #3f3f46;
+
+  --color-text: #fafafa;
+  --color-text-muted: #a1a1aa;
+  --color-text-subtle: #71717a;
+
+  --color-accent: oklch(0.6 0.15 260);
+  --color-accent-hover: oklch(0.68 0.15 260);
+  --color-accent-subtle: oklch(0.22 0.05 260);
+
+  --color-success: #22c55e;
+  --color-success-subtle: #052e16;
+  --color-warning: #f59e0b;
+  --color-warning-subtle: #451a03;
+  --color-destructive: #ef4444;
+  --color-destructive-subtle: #450a0a;
+
+  --shadow-popover: 0 4px 12px rgba(0, 0, 0, 0.3), 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
+* {
+  border-color: var(--color-border);
+}
+
+html {
+  /* Prevent iOS text size adjust on orientation change */
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  background: var(--color-background);
+  color: var(--color-text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Helvetica Neue", Helvetica, Arial, sans-serif;
+  /* Prevent horizontal overflow on mobile */
+  overflow-x: hidden;
+}
+
+/* Safe area support for notched devices */
+.safe-area-top {
+  padding-top: env(safe-area-inset-top, 0px);
+}
+.safe-area-bottom {
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+.safe-area-left {
+  padding-left: env(safe-area-inset-left, 0px);
+}
+.safe-area-right {
+  padding-right: env(safe-area-inset-right, 0px);
+}
+
+/* Mobile table card layout - used for responsive tables */
+@media (max-width: 767px) {
+  .mobile-card-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .mobile-card-list thead {
+    display: none;
+  }
+  .mobile-card-list tbody {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .mobile-card-list tr {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px;
+    border: 1px solid var(--color-border);
+    border-radius: var(--radius-md);
+    background: var(--color-surface);
+  }
+  .mobile-card-list td {
+    padding: 0 !important;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .mobile-card-list td::before {
+    content: attr(data-label);
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--color-text-muted);
+    flex-shrink: 0;
+    margin-right: 12px;
+  }
+}
+
+/* Word break for long text/URLs on mobile */
+.mobile-break-all {
+  overflow-wrap: break-word;
+  word-break: break-all;
+}
+
+/* Touch-friendly minimum tap target */
+.tap-target {
+  min-height: 44px;
+  min-width: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Mobile input font-size to prevent iOS zoom */
+@media (max-width: 767px) {
+  input[type="text"],
+  input[type="email"],
+  input[type="password"],
+  input[type="number"],
+  input[type="date"],
+  input[type="search"],
+  input[type="tel"],
+  input[type="url"],
+  select,
+  textarea {
+    font-size: 16px !important;
+  }
+}
+
+/* Custom scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-muted);
+}
+
+/* Focus styles */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

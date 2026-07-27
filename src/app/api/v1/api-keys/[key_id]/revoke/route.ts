@@ -1,0 +1,39 @@
+import { NextRequest } from 'next/server';
+import { authenticateRequest, successResponse, errorResponse } from '@/server/api-helpers';
+import { AppError, ErrorCodes } from '@/server/errors';
+
+export async function POST(
+  request: NextRequest,
+  { params }: { params: Promise<{ key_id: string }> }
+) {
+  try {
+    const { key_id } = await params;
+    const auth = await authenticateRequest(request);
+
+    const { getSupabaseServerClient } = await import('@/storage/database/supabase-client');
+    const supabase = getSupabaseServerClient();
+
+    // Verify ownership
+    const { data: existing } = await supabase
+      .from('api_keys')
+      .select('user_id')
+      .eq('id', key_id)
+      .single();
+
+    if (!existing) throw new AppError(ErrorCodes.TASK_NOT_FOUND, '密钥不存在');
+    if (auth.role !== 'admin' && existing.user_id !== auth.userId) {
+      throw new AppError(ErrorCodes.FORBIDDEN, '无权操作此密钥');
+    }
+
+    const { error } = await supabase
+      .from('api_keys')
+      .update({ revoked_at: new Date().toISOString() })
+      .eq('id', key_id);
+
+    if (error) throw new AppError(ErrorCodes.INTERNAL_ERROR, '吊销失败');
+
+    return successResponse({ revoked: true }, auth.requestId);
+  } catch (err) {
+    return errorResponse(err, '');
+  }
+}
