@@ -1,10 +1,65 @@
 import { getSupabaseClient } from '@/storage/database/supabase-client';
-import { AppError, ErrorCodes, type ErrorCode } from '@/server/errors';
+import {
+  AppError,
+  ErrorCodes,
+  type ErrorCode,
+  isRetryableProviderError,
+} from '@/server/errors';
 import { logger } from '@/server/logging';
 import { canTransition, type TaskStatus, type TaskType } from './state-machine';
 import { generateWithModel, getModelConfig } from '@/server/providers/images';
-import { uploadFile, generateSignedUrl, deleteFile } from '@/server/storage';
+import {
+  uploadFile,
+  generateSignedUrl,
+  assertSafeUrl,
+  fetchToBuffer,
+  MAX_DOWNLOAD_BYTES,
+} from '@/server/storage';
 import type { ProviderGenerationRequest } from '@/server/providers/images/types';
+
+/**
+ * PostgreSQL error code for unique_violation. Returned by Supabase when
+ * a UNIQUE constraint (e.g. on (user_id, idempotency_key)) is violated.
+ */
+const PG_UNIQUE_VIOLATION = '23505';
+
+/**
+ * Narrows an unknown caught value to a PostgREST/Postgres-style error
+ * with `code` and `message` fields. Supabase JS client surfaces these
+ * as objects with those string fields (not instances of Error).
+ */
+function isPostgresLikeError(err: unknown): err is { code: string; message: string } {
+  if (!err || typeof err !== 'object') return false;
+  const obj = err as Record<string, unknown>;
+  return (
+    (typeof obj.code === 'string' || obj.code === undefined) &&
+    (typeof obj.message === 'string' || obj.message === undefined)
+  );
+}
+
+/**
+ * Inspects an unknown caught error and decides whether it represents a
+ * Postgres unique_violation (23505) — either via the structured `code`
+ * field or via substring matches on `message` (Supabase wraps 23505 in
+ * both shapes depending on whether it came through .single() or not).
+ */
+function isUniqueViolationError(err: unknown): boolean {
+  if (!isPostgresLikeError(err)) return false;
+  const code = err.code ?? '';
+  const message = (err.message ?? '').toLowerCase();
+  return (
+    code === PG_UNIQUE_VIOLATION ||
+    message.includes(PG_UNIQUE_VIOLATION) ||
+    message.includes('duplicate') ||
+    message.includes('unique')
+  );
+}
+
+function errorMessageOf(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (isPostgresLikeError(err) && typeof err.message === 'string') return err.message;
+  return 'Unknown error';
+}
 
 export interface CreateTaskParams {
   user_id: string;
@@ -15,6 +70,12 @@ export interface CreateTaskParams {
   idempotency_key?: string;
   reference_asset_ids?: string[];
   custom_headers?: Record<string, string>;
+  /**
+   * Origin of the request. Stored on usage_records.request_source.
+   * Defaults to 'web'. Do NOT infer from custom_headers (those can be
+   * spoofed by the client).
+   */
+  requestSource?: 'api' | 'web';
 }
 
 export interface GenerationTask {
@@ -46,7 +107,10 @@ export interface GenerationTask {
 export async function createTask(params: CreateTaskParams): Promise<GenerationTask> {
   const client = getSupabaseClient();
 
-  // Check idempotency
+  // Fast path: most idempotent requests are first-time, so we still try
+  // a select-then-insert. The race window is closed by the unique
+  // constraint at the DB layer; we additionally catch the 23505
+  // violation below to recover gracefully on collision.
   if (params.idempotency_key) {
     const { data: existing } = await client
       .from('generation_tasks')
@@ -63,50 +127,103 @@ export async function createTask(params: CreateTaskParams): Promise<GenerationTa
 
   const modelConfig = await getModelConfig(params.model_code);
 
-  const { data, error } = await client
-    .from('generation_tasks')
-    .insert({
-      user_id: params.user_id,
-      model_config_id: modelConfig.id,
-      task_type: params.task_type,
-      status: 'queued',
-      prompt: params.prompt,
-      request_parameters: params.request_parameters || {},
-      idempotency_key: params.idempotency_key || null,
-      attempt_count: 0,
-    })
-    .select()
-    .single();
+  let data: unknown = null;
+  try {
+    const insertResult = await client
+      .from('generation_tasks')
+      .insert({
+        user_id: params.user_id,
+        model_config_id: modelConfig.id,
+        task_type: params.task_type,
+        status: 'queued',
+        prompt: params.prompt,
+        request_parameters: params.request_parameters || {},
+        idempotency_key: params.idempotency_key || null,
+        attempt_count: 0,
+      })
+      .select()
+      .single();
+    if (insertResult.error || !insertResult.data) {
+      throw insertResult.error ?? new Error('insert returned no data');
+    }
+    data = insertResult.data;
+  } catch (err: unknown) {
+    // 23505 = unique_violation. If the (user_id, idempotency_key) row
+    // was inserted by a concurrent request between our SELECT and
+    // INSERT, fall back to returning that existing row.
+    const isUniqueViolation = isUniqueViolationError(err);
 
-  if (error || !data) {
-    logger.error('Failed to create task', { error: error?.message, user_id: params.user_id });
-    throw new AppError(ErrorCodes.INTERNAL_ERROR, 'Failed to create generation task');
+    if (params.idempotency_key && isUniqueViolation) {
+      logger.warn('Idempotency conflict on insert, returning existing task', {
+        user_id: params.user_id,
+        idempotency_key: params.idempotency_key,
+        action: 'create_task_idempotency_conflict',
+      });
+      const { data: existing } = await client
+        .from('generation_tasks')
+        .select('*')
+        .eq('user_id', params.user_id)
+        .eq('idempotency_key', params.idempotency_key)
+        .is('deleted_at', null)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .single();
+
+      if (existing) {
+        return existing as unknown as GenerationTask;
+      }
+    }
+
+    logger.error('Failed to create task', {
+      error: errorMessageOf(err),
+      user_id: params.user_id,
+    });
+    throw new AppError(
+      isUniqueViolation ? ErrorCodes.IDEMPOTENCY_CONFLICT : ErrorCodes.INTERNAL_ERROR,
+      'Failed to create generation task'
+    );
   }
 
-  // Create usage record
-  await client.from('usage_records').insert({
-    user_id: params.user_id,
-    task_id: data.id,
-    model_config_id: modelConfig.id,
-    request_source: params.custom_headers ? 'api' : 'web',
-    requested_image_count: (params.request_parameters?.n as number) || 1,
-    status: 'queued',
-  });
+  const task = data as { id: string };
+
+  // Create usage record. request_source is taken from the explicit
+  // params field — never inferred from custom_headers (which can be
+  // spoofed by clients).
+  const requestSource: 'api' | 'web' = params.requestSource ?? 'web';
+  try {
+    await client.from('usage_records').insert({
+      user_id: params.user_id,
+      task_id: task.id,
+      model_config_id: modelConfig.id,
+      request_source: requestSource,
+      requested_image_count: (params.request_parameters?.n as number) || 1,
+      status: 'queued',
+    });
+  } catch (usageErr: unknown) {
+    // If the usage record insert fails (e.g. unique violation from a
+    // concurrent duplicate), do not fail the whole create. The task row
+    // already exists; downstream code will still see status='queued'.
+    logger.error('Failed to create usage record', {
+      task_id: task.id,
+      error: errorMessageOf(usageErr),
+    });
+  }
 
   // Link pre-uploaded reference assets to this task
   if (params.reference_asset_ids && params.reference_asset_ids.length > 0) {
     await client
       .from('generation_references')
-      .update({ task_id: data.id })
+      .update({ task_id: task.id })
       .in('id', params.reference_asset_ids)
       .eq('user_id', params.user_id)
       .is('task_id', null);
   }
 
   logger.info('Task created', {
-    task_id: data.id,
+    task_id: task.id,
     user_id: params.user_id,
     model_code: params.model_code,
+    request_source: requestSource,
     action: 'create_task',
   });
 
@@ -133,9 +250,12 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
     return;
   }
 
-  // Update to running
+  // Optimistic lock: only this worker can flip queued -> running.
+  // If another worker already claimed the task (or it was cancelled),
+  // the conditional update matches 0 rows and we bail out to avoid
+  // duplicate execution / double-billing.
   const startTime = Date.now();
-  await client
+  const { data: claimed, count } = await client
     .from('generation_tasks')
     .update({
       status: 'running',
@@ -143,7 +263,19 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
       attempt_count: task.attempt_count + 1,
       updated_at: new Date().toISOString(),
     })
-    .eq('id', taskId);
+    .eq('id', taskId)
+    .eq('status', 'queued')
+    .select();
+
+  if (!claimed || claimed.length === 0) {
+    logger.warn('Task already claimed or no longer queued', {
+      task_id: taskId,
+      status: task.status,
+      count: count ?? 0,
+      action: 'execute_task_skipped',
+    });
+    return;
+  }
 
   try {
     // Get model config
@@ -162,22 +294,9 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
     } else if (task.request_parameters?.reference_image_urls) {
       const urls = task.request_parameters.reference_image_urls as string[];
       // If already data URIs, pass through directly
-      // Otherwise fetch and convert to data URIs
+      // Otherwise fetch and convert to data URIs (with SSRF + size guards)
       referenceUrls = await Promise.all(
-        urls.map(async (url) => {
-          if (url.startsWith('data:')) {
-            return url; // Already a data URI, pass through
-          }
-          try {
-            const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
-            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-            const buffer = Buffer.from(await resp.arrayBuffer());
-            const contentType = resp.headers.get('content-type') || 'image/png';
-            return `data:${contentType};base64,${buffer.toString('base64')}`;
-          } catch {
-            return url;
-          }
-        })
+        urls.map(async (url) => fetchToDataUri(url))
       );
     } else if (task.request_parameters?.reference_asset_ids) {
       const assetIds = task.request_parameters.reference_asset_ids as string[];
@@ -190,18 +309,7 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
 
       if (refs && refs.length > 0) {
         referenceUrls = await Promise.all(
-          refs.map(async (r) => {
-            const url = await generateSignedUrl(r.object_key, 300);
-            try {
-              const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
-              if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-              const buffer = Buffer.from(await resp.arrayBuffer());
-              const contentType = resp.headers.get('content-type') || 'image/png';
-              return `data:${contentType};base64,${buffer.toString('base64')}`;
-            } catch {
-              return url;
-            }
-          })
+          refs.map(async (r) => fetchToDataUri(await generateSignedUrl(r.object_key, 300)))
         );
       } else {
         // Fall back to generation_references
@@ -213,18 +321,7 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
 
         if (refs2 && refs2.length > 0) {
           referenceUrls = await Promise.all(
-            refs2.map(async (r) => {
-              const url = await generateSignedUrl(r.object_key, 300);
-              try {
-                const resp = await fetch(url, { signal: AbortSignal.timeout(10000) });
-                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-                const buffer = Buffer.from(await resp.arrayBuffer());
-                const contentType = resp.headers.get('content-type') || 'image/png';
-                return `data:${contentType};base64,${buffer.toString('base64')}`;
-              } catch {
-                return url;
-              }
-            })
+            refs2.map(async (r) => fetchToDataUri(await generateSignedUrl(r.object_key, 300)))
           );
         }
       }
@@ -257,19 +354,21 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
 
         try {
           let objectKey: string;
+          const targetKey = `users/${task.user_id}/generated/${new Date().getFullYear()}/${(new Date().getMonth() + 1).toString().padStart(2, '0')}/${taskId}_${idx}.png`;
 
           if (urlOrB64.startsWith('http')) {
-            // Download from provider URL and persist
-            const targetKey = `users/${task.user_id}/generated/${new Date().getFullYear()}/${(new Date().getMonth() + 1).toString().padStart(2, '0')}/${taskId}_${idx}.png`;
-            objectKey = await uploadFile(
-              Buffer.from(await (await fetch(urlOrB64)).arrayBuffer()),
-              targetKey,
-              'image/png'
-            );
+            // Download from provider URL and persist. fetchToBuffer
+            // applies SSRF + 20MB size guard. Provider URLs are trusted
+            // by convention, but the guard still catches redirect
+            // chains to private hosts.
+            const { buffer, contentType } = await fetchToBuffer(urlOrB64);
+            objectKey = await uploadFile(buffer, targetKey, contentType);
           } else {
             // Base64 - decode and upload
             const buffer = Buffer.from(urlOrB64, 'base64');
-            const targetKey = `users/${task.user_id}/generated/${new Date().getFullYear()}/${(new Date().getMonth() + 1).toString().padStart(2, '0')}/${taskId}_${idx}.png`;
+            if (buffer.byteLength > MAX_DOWNLOAD_BYTES) {
+              throw new AppError(ErrorCodes.FILE_TOO_LARGE, 'Decoded asset exceeds size limit');
+            }
             objectKey = await uploadFile(buffer, targetKey, 'image/png');
           }
 
@@ -294,8 +393,9 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
         }
       }
 
-      // Update task to succeeded
-      await client
+      // Optimistic lock on running -> succeeded. If a parallel worker
+      // somehow flipped status, we don't overwrite it.
+      const { data: succeeded } = await client
         .from('generation_tasks')
         .update({
           status: 'succeeded',
@@ -304,24 +404,33 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
           provider_request_id: result.usage ? `gen_${Date.now()}` : null,
           updated_at: new Date().toISOString(),
         })
-        .eq('id', taskId);
+        .eq('id', taskId)
+        .eq('status', 'running')
+        .select();
 
-      // Update usage record
-      await client
-        .from('usage_records')
-        .update({
-          generated_image_count: generatedCount,
-          status: 'succeeded',
+      if (succeeded && succeeded.length > 0) {
+        // Update usage record
+        await client
+          .from('usage_records')
+          .update({
+            generated_image_count: generatedCount,
+            status: 'succeeded',
+            latency_ms: latencyMs,
+          })
+          .eq('task_id', taskId);
+
+        logger.info('Task completed successfully', {
+          task_id: taskId,
           latency_ms: latencyMs,
-        })
-        .eq('task_id', taskId);
-
-      logger.info('Task completed successfully', {
-        task_id: taskId,
-        latency_ms: latencyMs,
-        generated_count: generatedCount,
-        action: 'task_succeeded',
-      });
+          generated_count: generatedCount,
+          action: 'task_succeeded',
+        });
+      } else {
+        logger.warn('Task succeeded update skipped (status changed concurrently)', {
+          task_id: taskId,
+          action: 'task_succeeded_skipped',
+        });
+      }
     } else {
       // Provider returned errors
       const errorMsg = result.error_messages.join('; ');
@@ -329,31 +438,76 @@ export async function executeTask(taskId: string, customHeaders?: Record<string,
     }
   } catch (error) {
     const latencyMs = Date.now() - startTime;
-    const errorCode = error instanceof AppError ? error.code : ErrorCodes.PROVIDER_ERROR;
+    const errorCode: ErrorCode = error instanceof AppError ? error.code : ErrorCodes.PROVIDER_ERROR;
     const errorMsg = error instanceof Error ? error.message : 'Unknown provider error';
     await markTaskFailed(taskId, errorCode, errorMsg, latencyMs);
   }
 }
 
+/**
+ * Fetch a URL and convert it to a data: URI suitable for embedding in
+ * provider requests. Applies SSRF + size guards via fetchToBuffer.
+ * Returns the original value only if it is already a data: URI (which
+ * is by definition safe to embed).
+ */
+async function fetchToDataUri(url: string): Promise<string> {
+  if (url.startsWith('data:')) {
+    return url;
+  }
+  // assertSafeUrl runs inside fetchToBuffer; we call it here too so the
+  // error is thrown before any network call and surfaces a clean
+  // SSRF_BLOCKED code.
+  assertSafeUrl(url);
+  const { buffer, contentType } = await fetchToBuffer(url);
+  return `data:${contentType};base64,${buffer.toString('base64')}`;
+}
+
+/**
+ * Mark a task as failed. Uses an optimistic lock (status='running') so
+ * that a concurrently-cancelled or already-terminal task is not
+ * overwritten. Records the retryable flag in error_message as JSON so
+ * retryTask consumers (and ops dashboards) can decide whether to retry.
+ */
 async function markTaskFailed(
   taskId: string,
-  errorCode: string,
+  errorCode: ErrorCode | string,
   errorMessage: string,
   latencyMs: number
 ): Promise<void> {
   const client = getSupabaseClient();
 
-  await client
+  const retryable = isRetryableProviderError(errorCode);
+  // Embed is_retryable in error_message as JSON. Schema migration to a
+  // dedicated is_retryable column is owned by Agent 2; for now we
+  // serialize {message, is_retryable, code} so consumers can parse it.
+  const structuredError = JSON.stringify({
+    message: errorMessage,
+    code: errorCode,
+    is_retryable: retryable,
+  });
+
+  const { data: updated } = await client
     .from('generation_tasks')
     .update({
       status: 'failed',
       completed_at: new Date().toISOString(),
       error_code: errorCode,
-      error_message: errorMessage,
+      error_message: structuredError,
       latency_ms: latencyMs,
       updated_at: new Date().toISOString(),
     })
-    .eq('id', taskId);
+    .eq('id', taskId)
+    .eq('status', 'running')
+    .select();
+
+  if (!updated || updated.length === 0) {
+    logger.warn('Task failed update skipped (status changed concurrently)', {
+      task_id: taskId,
+      error_code: errorCode,
+      action: 'task_failed_skipped',
+    });
+    return;
+  }
 
   await client
     .from('usage_records')
@@ -367,6 +521,7 @@ async function markTaskFailed(
     task_id: taskId,
     error_code: errorCode,
     error_message: errorMessage,
+    is_retryable: retryable,
     action: 'task_failed',
   });
 }
@@ -530,14 +685,27 @@ export async function cancelTask(taskId: string, userId: string, isAdmin: boolea
     throw new AppError(ErrorCodes.INVALID_TASK_STATE, `Cannot cancel task in ${task.status} state`);
   }
 
-  await client
+  // Optimistic lock: cancel only succeeds if the task is still in the
+  // status we read. A worker that just flipped it to 'running' or a
+  // parallel cancel request will cause this update to affect 0 rows,
+  // in which case we report the current state to the caller.
+  const { data: cancelled } = await client
     .from('generation_tasks')
     .update({
       status: 'cancelled',
       cancelled_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     })
-    .eq('id', taskId);
+    .eq('id', taskId)
+    .eq('status', task.status)
+    .select();
+
+  if (!cancelled || cancelled.length === 0) {
+    throw new AppError(
+      ErrorCodes.INVALID_TASK_STATE,
+      `Task was no longer in ${task.status} state (likely changed concurrently); cancellation aborted.`
+    );
+  }
 }
 
 export async function retryTask(taskId: string, userId: string, isAdmin: boolean): Promise<GenerationTask> {
@@ -553,7 +721,9 @@ export async function retryTask(taskId: string, userId: string, isAdmin: boolean
     throw new AppError(ErrorCodes.INVALID_TASK_STATE, 'Task cannot be retried');
   }
 
-  await client
+  // Optimistic lock: only retry if still failed (prevents double-retry
+  // when the user double-clicks).
+  const { data: queued } = await client
     .from('generation_tasks')
     .update({
       status: 'queued',
@@ -562,7 +732,29 @@ export async function retryTask(taskId: string, userId: string, isAdmin: boolean
       error_details: null,
       updated_at: new Date().toISOString(),
     })
-    .eq('id', taskId);
+    .eq('id', taskId)
+    .eq('status', 'failed')
+    .select();
+
+  if (!queued || queued.length === 0) {
+    throw new AppError(
+      ErrorCodes.INVALID_TASK_STATE,
+      'Task was no longer in failed state (likely retried concurrently); retry aborted.'
+    );
+  }
+
+  // Sync the usage_records row back to 'queued' so that quota counters
+  // (which count queued/running/succeeded) treat this slot as active
+  // again. Without this, a failed-then-retried task would be counted
+  // twice in the daily/monthly totals (once as failed-but-ignored, once
+  // for the new run), or zero times if the failed row had been excluded.
+  await client
+    .from('usage_records')
+    .update({
+      status: 'queued',
+      updated_at: new Date().toISOString(),
+    })
+    .eq('task_id', taskId);
 
   // Execute immediately (inline executor)
   executeTask(taskId).catch((err) => {

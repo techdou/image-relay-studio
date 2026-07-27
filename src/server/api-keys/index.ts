@@ -1,4 +1,4 @@
-import { randomBytes, createHash } from 'crypto';
+import { randomBytes, createHash, timingSafeEqual } from 'crypto';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { AppError, ErrorCodes } from '@/server/errors';
 import { logger } from '@/server/logging';
@@ -101,34 +101,119 @@ export async function revokeApiKey(keyId: string, userId: string): Promise<void>
 // Alias for route consumers
 export const generateApiKey = createApiKey;
 
+/**
+ * Coerce a DB-stored `scopes` value (jsonb) into a `string[]`.
+ *
+ * The column default is `'["images:read","images:write"]'::jsonb`, but historic
+ * rows or direct DB edits may store non-array values. We defensively normalise
+ * to an empty array instead of throwing so that a malformed row never crashes
+ * the auth path.
+ */
+function coerceScopes(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.filter((s): s is string => typeof s === 'string');
+  }
+  return [];
+}
+
+/**
+ * Timing-safe equality check for two hex digest strings.
+ *
+ * We always compare fixed-length SHA-256 hex digests (64 chars), so the input
+ * lengths are constant. A defensive fallback hashes both inputs first to avoid
+ * leaking length information in the (theoretically impossible) case where the
+ * stored hash has been tampered with to a different length.
+ */
+function safeEqualHex(expected: string, actual: string): boolean {
+  const expectedBuf = Buffer.from(expected, 'utf8');
+  const actualBuf = Buffer.from(actual, 'utf8');
+  if (expectedBuf.length === actualBuf.length) {
+    return timingSafeEqual(expectedBuf, actualBuf);
+  }
+  // Length mismatch: don't return false immediately. Instead hash both inputs
+  // to equal fixed-length digests and compare those, so the timing depends on
+  // the (constant) hash length rather than the differing input lengths.
+  const a = createHash('sha256').update(expectedBuf).digest();
+  const b = createHash('sha256').update(actualBuf).digest();
+  return timingSafeEqual(a, b);
+}
+
 export async function validateApiKey(rawKey: string): Promise<ApiKeyInfo | null> {
+  if (typeof rawKey !== 'string' || !rawKey.startsWith(KEY_PREFIX)) {
+    return null;
+  }
+
   const pepper = process.env.API_KEY_HASH_PEPPER || '';
   const keyHash = createHash('sha256').update(rawKey + pepper).digest('hex');
   const keyPrefix = rawKey.substring(0, 12);
 
   const client = getSupabaseClient();
-  const { data, error } = await client
-    .from('api_keys')
-    .select('id, user_id, name, key_prefix, scopes, last_used_at, expires_at, revoked_at, created_at')
-    .eq('key_prefix', keyPrefix)
-    .eq('key_hash', keyHash)
-    .is('revoked_at', null)
-    .single();
 
-  if (error || !data) {
+  // Pull candidate rows by prefix only (≤10), then compare hashes in the
+  // application layer with timingSafeEqual. Filtering on `key_hash` in SQL
+  // would leak whether a candidate matched via row-presence / query timing
+  // and is not constant-time.
+  const { data: candidates, error } = await client
+    .from('api_keys')
+    .select('id, user_id, name, key_prefix, key_hash, scopes, last_used_at, expires_at, revoked_at, created_at')
+    .eq('key_prefix', keyPrefix)
+    .is('revoked_at', null)
+    .limit(10);
+
+  if (error || !candidates || candidates.length === 0) {
+    return null;
+  }
+
+  // Iterate ALL candidates and compare each stored hash in constant time so
+  // that timing does not reveal which prefix row (if any) matched. We do not
+  // break early on the first match to keep the loop length uniform.
+  let matchedRow: (typeof candidates)[number] | null = null;
+  for (const row of candidates) {
+    const storedHash = row.key_hash as unknown;
+    if (typeof storedHash !== 'string') {
+      // Skip rows with a malformed hash but keep iterating to preserve timing.
+      continue;
+    }
+    if (safeEqualHex(storedHash, keyHash)) {
+      matchedRow = row;
+      // Do NOT break: continue iterating over remaining candidates to keep
+      // the work factor independent of which row matched.
+    }
+  }
+
+  if (!matchedRow) {
     return null;
   }
 
   // Check expiry
-  if (data.expires_at && new Date(data.expires_at) < new Date()) {
+  if (matchedRow.expires_at && new Date(matchedRow.expires_at) < new Date()) {
     return null;
   }
 
-  // Update last_used_at
-  await client
+  // Update last_used_at (fire-and-forget, errors here are non-fatal)
+  client
     .from('api_keys')
     .update({ last_used_at: new Date().toISOString() })
-    .eq('id', data.id);
+    .eq('id', matchedRow.id)
+    .then(
+      () => { /* last_used_at update succeeded — nothing to log */ },
+      (err: unknown) => {
+        logger.warn('Failed to update api_keys.last_used_at', {
+          key_id: matchedRow?.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    );
 
-  return data as unknown as ApiKeyInfo;
+  return {
+    id: matchedRow.id,
+    user_id: matchedRow.user_id,
+    name: matchedRow.name,
+    key_prefix: matchedRow.key_prefix,
+    scopes: coerceScopes(matchedRow.scopes),
+    last_used_at: matchedRow.last_used_at,
+    expires_at: matchedRow.expires_at,
+    revoked_at: matchedRow.revoked_at,
+    created_at: matchedRow.created_at,
+  };
 }

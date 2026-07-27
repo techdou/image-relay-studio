@@ -93,7 +93,13 @@ export async function checkQuota(userId: string, modelCode: string): Promise<voi
     }
   }
 
-  // Check daily quota
+  // Check daily quota.
+  // Counts usage_records in {queued, running, succeeded} — i.e. "active
+  // quota slots". Failed records do NOT consume quota (the user should
+  // be able to retry without being penalised for provider errors).
+  // For this invariant to hold, retryTask in executor.ts MUST flip the
+  // matching usage_records row back to 'queued' so the retry consumes
+  // the existing slot rather than opening a new one.
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const { count: dailyCount } = await client
@@ -107,7 +113,7 @@ export async function checkQuota(userId: string, modelCode: string): Promise<voi
     throw new AppError(ErrorCodes.QUOTA_EXCEEDED, 'Daily image generation limit exceeded');
   }
 
-  // Check monthly quota
+  // Check monthly quota (same semantics as daily above).
   const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
   const { count: monthlyCount } = await client
     .from('usage_records')

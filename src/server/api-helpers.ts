@@ -1,7 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSupabaseServerClient } from '@/storage/database/supabase-client';
-import { generateRequestId } from '@/server/logging';
+import { generateRequestId, logger } from '@/server/logging';
 import { AppError, ErrorCodes, errorStatusMap } from '@/server/errors';
+import { checkRateLimit } from '@/server/rate-limit';
+
+export type AuthMethod = 'apikey' | 'session';
 
 export interface AuthResult {
   userId: string;
@@ -15,6 +18,18 @@ export interface AuthResult {
     [key: string]: unknown;
   };
   requestId: string;
+  /**
+   * How the caller authenticated for this request.
+   * - `'apikey'`: validated via the `irs_live_*` API key flow.
+   * - `'session'`: validated via a Supabase session/JWT token.
+   */
+  authMethod: AuthMethod;
+  /**
+   * Scopes attached to the API key, if `authMethod === 'apikey'`.
+   * Always `undefined` for session-authenticated requests; session callers are
+   * currently treated as having full access.
+   */
+  scopes?: string[];
 }
 
 export async function authenticateRequest(request: NextRequest): Promise<AuthResult> {
@@ -24,12 +39,15 @@ export async function authenticateRequest(request: NextRequest): Promise<AuthRes
   const authHeader = request.headers.get('authorization');
 
   let userId: string | null = null;
+  let authMethod: AuthMethod | null = null;
+  let scopes: string[] | undefined = undefined;
 
   if (sessionToken) {
     const supabase = getSupabaseServerClient();
     const { data, error } = await supabase.auth.getUser(sessionToken);
     if (!error && data.user) {
       userId = data.user.id;
+      authMethod = 'session';
     }
   } else if (authHeader) {
     if (authHeader.startsWith('Bearer ')) {
@@ -39,18 +57,21 @@ export async function authenticateRequest(request: NextRequest): Promise<AuthRes
         const result = await validateApiKey(token);
         if (result) {
           userId = result.user_id;
+          authMethod = 'apikey';
+          scopes = result.scopes;
         }
       } else {
         const supabase = getSupabaseServerClient();
         const { data, error } = await supabase.auth.getUser(token);
         if (!error && data.user) {
           userId = data.user.id;
+          authMethod = 'session';
         }
       }
     }
   }
 
-  if (!userId) {
+  if (!userId || !authMethod) {
     // If the request had an Authorization header, it's an API key issue
     if (authHeader && authHeader.startsWith('Bearer ')) {
       const token = authHeader.slice(7);
@@ -83,12 +104,100 @@ export async function authenticateRequest(request: NextRequest): Promise<AuthRes
     role: profile.role,
     profile,
     requestId,
+    authMethod,
+    // Only attach `scopes` for API-key auth; leave undefined for sessions.
+    scopes: authMethod === 'apikey' ? scopes : undefined,
   };
 }
 
 export function requireAdmin(auth: AuthResult): void {
   if (auth.role !== 'admin') {
     throw new AppError(ErrorCodes.FORBIDDEN, '无权访问管理接口');
+  }
+}
+
+/**
+ * Enforce that an API-key-authenticated request carries a specific scope.
+ *
+ * Session-authenticated requests (`authMethod === 'session'`) bypass scope
+ * checks; scopes are an API-key-only concept. Admins are NOT auto-granted any
+ * scope here — admins using an API key must still possess the required scope
+ * explicitly, matching the principle of least privilege.
+ *
+ * @throws {AppError} FORBIDDEN when the scope is missing.
+ */
+export function requireScope(auth: AuthResult, requiredScope: string): void {
+  if (auth.authMethod === 'session') {
+    return;
+  }
+  const granted = auth.scopes;
+  if (!Array.isArray(granted) || !granted.includes(requiredScope)) {
+    throw new AppError(
+      ErrorCodes.FORBIDDEN,
+      `Required scope: ${requiredScope}`,
+      { required_scope: requiredScope, granted_scopes: granted ?? [] }
+    );
+  }
+}
+
+/**
+ * Extract the client IP from common proxy headers. Falls back to 'unknown'
+ * if no proxy header is present (e.g. direct invocation in tests).
+ */
+export function getClientIp(request: NextRequest): string {
+  const xForwardedFor = request.headers.get('x-forwarded-for');
+  if (xForwardedFor) {
+    // x-forwarded-for may be a comma-separated list; the first entry is the
+    // original client.
+    const first = xForwardedFor.split(',')[0];
+    if (first) {
+      return first.trim();
+    }
+  }
+  const xRealIp = request.headers.get('x-real-ip');
+  if (xRealIp) {
+    return xRealIp.trim();
+  }
+  return 'unknown';
+}
+
+/**
+ * Per-user generation rate limit: 60 requests / minute.
+ * Apply this on image-generation and image-edit endpoints.
+ *
+ * @throws {AppError} RATE_LIMITED when the limit is exceeded.
+ */
+export function enforceGenerationRateLimit(userId: string): void {
+  const ok = checkRateLimit({
+    key: `gen:${userId}`,
+    maxRequests: 60,
+    windowMs: 60_000,
+  }).allowed;
+  if (!ok) {
+    throw new AppError(
+      ErrorCodes.RATE_LIMITED,
+      'Generation rate limit exceeded (60/min)'
+    );
+  }
+}
+
+/**
+ * Per-user upload rate limit: 30 requests / minute.
+ * Apply this on image upload endpoints (POST /api/v1/images etc.).
+ *
+ * @throws {AppError} RATE_LIMITED when the limit is exceeded.
+ */
+export function enforceUploadRateLimit(userId: string): void {
+  const ok = checkRateLimit({
+    key: `upload:${userId}`,
+    maxRequests: 30,
+    windowMs: 60_000,
+  }).allowed;
+  if (!ok) {
+    throw new AppError(
+      ErrorCodes.RATE_LIMITED,
+      'Upload rate limit exceeded (30/min)'
+    );
   }
 }
 
@@ -112,7 +221,16 @@ export function errorResponse(error: unknown, requestId: string): NextResponse {
     );
   }
 
-  console.error('Unhandled error:', error);
+  // Avoid dumping the raw error object (which may carry request payload,
+  // tokens, PII, etc.) straight to stderr. Reduce to its identity + message +
+  // stack. `logger` runs the entry through `sanitizeForLog`, masking any
+  // sensitive keys that slipped into a structured field.
+  const safeError = error instanceof Error
+    ? { name: error.name, message: error.message, stack: error.stack }
+    : String(error);
+
+  logger.error('Unhandled error', { error: safeError, request_id: requestId });
+
   return NextResponse.json(
     {
       error: {

@@ -7,6 +7,9 @@ export const ErrorCodes = {
   GENERATION_DISABLED: 'GENERATION_DISABLED',
   INVALID_REQUEST: 'INVALID_REQUEST',
   INVALID_FILE: 'INVALID_FILE',
+  VALIDATION_ERROR: 'VALIDATION_ERROR',
+  PROVIDER_ERROR_NETWORK: 'PROVIDER_ERROR_NETWORK',
+  SSRF_BLOCKED: 'SSRF_BLOCKED',
   MODEL_NOT_FOUND: 'MODEL_NOT_FOUND',
   MODEL_DISABLED: 'MODEL_DISABLED',
   MODEL_NOT_ALLOWED: 'MODEL_NOT_ALLOWED',
@@ -38,7 +41,23 @@ const RETRYABLE_ERRORS: ErrorCode[] = [
   ErrorCodes.PROVIDER_RATE_LIMITED,
   ErrorCodes.STORAGE_ERROR,
   ErrorCodes.INTERNAL_ERROR,
+  ErrorCodes.PROVIDER_ERROR_NETWORK,
 ];
+
+/**
+ * Provider error codes that should be considered retryable.
+ * Used by executor to flag failures that can safely be retried.
+ */
+export const RETRYABLE_PROVIDER_ERRORS: ReadonlySet<ErrorCode> = new Set<ErrorCode>([
+  ErrorCodes.PROVIDER_TIMEOUT,
+  ErrorCodes.PROVIDER_RATE_LIMITED,
+  ErrorCodes.PROVIDER_ERROR_NETWORK,
+]);
+
+export function isRetryableProviderError(code: ErrorCode | string | null | undefined): boolean {
+  if (!code) return false;
+  return RETRYABLE_PROVIDER_ERRORS.has(code as ErrorCode);
+}
 
 export function isRetryableError(code: ErrorCode): boolean {
   return RETRYABLE_ERRORS.includes(code);
@@ -94,6 +113,8 @@ export const errorStatusMap: Record<ErrorCode, number> = {
   GENERATION_DISABLED: 503,
   INVALID_REQUEST: 400,
   INVALID_FILE: 400,
+  VALIDATION_ERROR: 400,
+  SSRF_BLOCKED: 400,
   MODEL_NOT_FOUND: 404,
   MODEL_DISABLED: 400,
   MODEL_NOT_ALLOWED: 403,
@@ -107,6 +128,7 @@ export const errorStatusMap: Record<ErrorCode, number> = {
   PROVIDER_RATE_LIMITED: 502,
   PROVIDER_REJECTED: 400,
   PROVIDER_ERROR: 502,
+  PROVIDER_ERROR_NETWORK: 502,
   STORAGE_ERROR: 500,
   INTERNAL_ERROR: 500,
   API_KEY_INVALID: 401,

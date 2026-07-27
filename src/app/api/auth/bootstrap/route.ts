@@ -1,8 +1,38 @@
-import { NextRequest } from 'next/server';
-import { randomBytes } from 'crypto';
+import { NextRequest, NextResponse } from 'next/server';
+import { randomBytes, createHash, timingSafeEqual } from 'crypto';
 import { successResponse, errorResponse } from '@/server/api-helpers';
 import { AppError, ErrorCodes } from '@/server/errors';
 import { logger } from '@/server/logging';
+import { checkRateLimit } from '@/server/rate-limit';
+
+/**
+ * Timing-safe string comparison that does not leak length information.
+ *
+ * Both inputs are SHA-256 hashed first, so the comparison is always performed
+ * against fixed-length 32-byte digests regardless of the input lengths. This
+ * avoids the length-correlation timing leak that a naive `Buffer.from(a)`
+ * comparison would introduce when `a` and `b` differ in length.
+ */
+function safeCompare(a: string, b: string): boolean {
+  const aBuf = createHash('sha256').update(a).digest();
+  const bBuf = createHash('sha256').update(b).digest();
+  return timingSafeEqual(aBuf, bBuf);
+}
+
+/**
+ * Extract the client IP from common proxy headers. Kept local because this
+ * route is hit before any user context exists (it bootstraps the first user).
+ */
+function getBootstrapIp(request: NextRequest): string {
+  const forwarded = request.headers.get('x-forwarded-for');
+  if (forwarded) {
+    const first = forwarded.split(',')[0];
+    if (first) return first.trim();
+  }
+  const realIp = request.headers.get('x-real-ip');
+  if (realIp) return realIp.trim();
+  return 'unknown';
+}
 
 /**
  * POST /api/auth/bootstrap
@@ -15,30 +45,69 @@ import { logger } from '@/server/logging';
  * Security:
  *   1. Only works when no admin exists yet (idempotent guard).
  *   2. Requires BOOTSTRAP_ADMIN_EMAIL env var to be set.
- *   3. In production (COZE_PROJECT_ENV=PROD), requires X-Bootstrap-Token header
- *      matching the BOOTSTRAP_TOKEN env var.
- *   4. In development, if BOOTSTRAP_TOKEN is set it must also match;
- *      if not set, the call is allowed without a token.
+ *   3. IP rate limited: 5 requests / minute per client IP (checked BEFORE
+ *      token validation so failed attempts are also throttled).
+ *   4. Token validation:
+ *      - In production (COZE_PROJECT_ENV=PROD), a non-empty BOOTSTRAP_TOKEN
+ *        is REQUIRED and the X-Bootstrap-Token header must match it using a
+ *        timing-safe comparison. An empty env token is a hard 403.
+ *      - In development, if BOOTSTRAP_TOKEN is set it must match; if it is
+ *        empty the call is allowed without a token (backward compatibility).
  *   5. Optionally requires BOOTSTRAP_ADMIN_PASSWORD for the initial password.
  *      If not set, a random password is generated and returned ONCE.
  */
 export async function POST(request: NextRequest) {
   try {
+    // ── 1. IP rate limit (BEFORE token check so probing is throttled) ──
+    const clientIp = getBootstrapIp(request);
+    const rateLimit = checkRateLimit({
+      key: `bootstrap:${clientIp}`,
+      maxRequests: 5,
+      windowMs: 60_000,
+    });
+    if (!rateLimit.allowed) {
+      logger.warn('Bootstrap: rate limited', { ip: clientIp });
+      return NextResponse.json(
+        {
+          error: {
+            code: ErrorCodes.RATE_LIMITED,
+            message: 'Too many bootstrap attempts. Please retry later.',
+          },
+          request_id: 'bootstrap',
+        },
+        { status: 429, headers: { 'Retry-After': String(Math.ceil((rateLimit.resetAt - Date.now()) / 1000)) } }
+      );
+    }
+
     const bootstrapEmail = process.env.BOOTSTRAP_ADMIN_EMAIL;
     if (!bootstrapEmail) {
       throw new AppError(ErrorCodes.INVALID_REQUEST, 'BOOTSTRAP_ADMIN_EMAIL 环境变量未配置');
     }
 
-    // Security: validate bootstrap token
-    const bootstrapToken = process.env.BOOTSTRAP_TOKEN;
+    // ── 2. Timing-safe token validation ──────────────────────────────
+    const bootstrapToken = process.env.BOOTSTRAP_TOKEN || '';
     const isProduction = process.env.COZE_PROJECT_ENV === 'PROD';
 
-    if (bootstrapToken || isProduction) {
-      const providedToken = request.headers.get('X-Bootstrap-Token');
-      if (!providedToken || providedToken !== bootstrapToken) {
+    // In PROD an empty configured token = not configured = hard reject.
+    // In DEV an empty token preserves the historical "no token needed" path.
+    if (isProduction && !bootstrapToken) {
+      logger.error('Bootstrap: BOOTSTRAP_TOKEN not configured in production', {
+        env: process.env.COZE_PROJECT_ENV,
+      });
+      throw new AppError(ErrorCodes.FORBIDDEN, 'Bootstrap token not configured');
+    }
+
+    if (bootstrapToken) {
+      const providedToken = request.headers.get('X-Bootstrap-Token') || '';
+      // Compare timing-safely. We deliberately run both an emptiness check
+      // (so the 401 message differs from a wrong-value attempt) AND the
+      // constant-time comparison (so wrong values don't leak via timing).
+      const providedPresent = providedToken.length > 0;
+      const valueMatches = providedPresent && safeCompare(providedToken, bootstrapToken);
+      if (!providedPresent || !valueMatches) {
         logger.warn('Bootstrap: invalid or missing token', {
-          has_env_token: !!bootstrapToken,
-          provided: !!providedToken,
+          has_env_token: true,
+          provided: providedPresent,
           env: process.env.COZE_PROJECT_ENV,
         });
         throw new AppError(ErrorCodes.UNAUTHORIZED, 'Bootstrap token 无效或未提供');
