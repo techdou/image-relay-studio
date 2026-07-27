@@ -3,6 +3,7 @@ import './globals.css';
 import { SupabaseConfigProvider } from '@/lib/supabase-config-inject';
 import { AuthProvider } from '@/lib/auth-context';
 import { ResourcePreconnect } from '@/components/resource-preconnect';
+import { Toaster } from '@/components/ui/sonner';
 
 export const metadata: Metadata = {
   title: 'Image Relay Studio',
@@ -24,6 +25,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <SupabaseConfigProvider>
           <AuthProvider>
             {children}
+            <Toaster />
           </AuthProvider>
         </SupabaseConfigProvider>
       </body>

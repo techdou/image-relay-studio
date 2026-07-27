@@ -1,6 +1,27 @@
 import { NextRequest } from 'next/server';
 import { authenticateRequest, successResponse, errorResponse, requireAdmin } from '@/server/api-helpers';
 import { AppError, ErrorCodes } from '@/server/errors';
+import { adminUpdateModelSchema } from '@/server/validation/admin-schemas';
+
+const UPDATABLE_FIELDS = [
+  'display_name',
+  'provider_type',
+  'external_model_id',
+  'workflow_id',
+  'enabled',
+  'sort_order',
+  'supports_text_to_image',
+  'supports_image_to_image',
+  'supports_multiple_references',
+  'supports_sequential_generation',
+  'supports_visible_watermark_control',
+  'supported_sizes',
+  'max_images_per_request',
+  'max_provider_concurrency',
+  'timeout_seconds',
+  'default_parameters',
+  'capability_metadata',
+] as const;
 
 export async function PATCH(
   request: NextRequest,
@@ -12,6 +33,13 @@ export async function PATCH(
     requireAdmin(auth);
 
     const body = await request.json();
+    const parsed = adminUpdateModelSchema.safeParse(body);
+    if (!parsed.success) {
+      throw new AppError(ErrorCodes.VALIDATION_ERROR, 'Invalid input', {
+        issues: parsed.error.issues,
+      });
+    }
+    const data = parsed.data;
 
     const { getSupabaseServerClient } = await import('@/storage/database/supabase-client');
     const supabase = getSupabaseServerClient();
@@ -26,15 +54,10 @@ export async function PATCH(
     if (!current) throw new AppError(ErrorCodes.MODEL_NOT_FOUND, '模型不存在');
 
     const updates: Record<string, unknown> = {};
-    const updatableFields = [
-      'display_name', 'provider_type', 'external_model_id', 'workflow_id',
-      'enabled', 'sort_order', 'supports_text_to_image', 'supports_image_to_image',
-      'supports_multiple_references', 'supports_sequential_generation',
-      'supports_visible_watermark_control', 'supported_sizes', 'max_images_per_request',
-      'max_provider_concurrency', 'timeout_seconds', 'default_parameters', 'capability_metadata'
-    ];
-    for (const field of updatableFields) {
-      if (body[field] !== undefined) updates[field] = body[field];
+    for (const field of UPDATABLE_FIELDS) {
+      if (data[field] !== undefined) {
+        updates[field] = data[field];
+      }
     }
 
     if (Object.keys(updates).length > 0) {

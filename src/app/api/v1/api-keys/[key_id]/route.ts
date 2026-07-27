@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { authenticateRequest, successResponse, errorResponse } from '@/server/api-helpers';
+import { authenticateRequest, successResponse, errorResponse, requireScope } from '@/server/api-helpers';
 import { AppError, ErrorCodes } from '@/server/errors';
 
 export async function PATCH(
@@ -9,6 +9,7 @@ export async function PATCH(
   try {
     const { key_id } = await params;
     const auth = await authenticateRequest(request);
+    requireScope(auth, 'api_keys:write');
     const body = await request.json();
     const { is_active } = body as { is_active?: boolean };
 
@@ -55,6 +56,7 @@ export async function DELETE(
   try {
     const { key_id } = await params;
     const auth = await authenticateRequest(request);
+    requireScope(auth, 'api_keys:write');
 
     const { getSupabaseServerClient } = await import('@/storage/database/supabase-client');
     const supabase = getSupabaseServerClient();

@@ -1,5 +1,7 @@
 import { NextRequest } from 'next/server';
 import { authenticateRequest, successResponse, errorResponse, requireAdmin } from '@/server/api-helpers';
+import { AppError, ErrorCodes } from '@/server/errors';
+import { logger } from '@/server/logging';
 
 export async function GET(request: NextRequest) {
   try {
@@ -25,7 +27,10 @@ export async function GET(request: NextRequest) {
     if (resourceType) query = query.eq('resource_type', resourceType);
 
     const { data, count, error } = await query;
-    if (error) throw new Error('查询审计日志失败');
+    if (error) {
+      logger.error('admin list audit logs failed', { error: error.message, request_id: auth.requestId });
+      throw new AppError(ErrorCodes.INTERNAL_ERROR, '查询审计日志失败');
+    }
 
     return successResponse({
       logs: data || [],

@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useCallback } from 'react';
+import { toast } from 'sonner';
 import { useAuth } from '@/lib/auth-context';
 import { fetchWithTimeout } from '@/lib/fetch-utils';
 import { TableSkeleton, ErrorState, EmptyState } from '@/components/loading-states';
@@ -24,6 +25,7 @@ export default function ApiKeysPage() {
   const [newKeyName, setNewKeyName] = useState('');
   const [createdKey, setCreatedKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
 
   const fetchKeys = useCallback(async () => {
     setIsLoading(true);
@@ -68,13 +70,18 @@ export default function ApiKeysPage() {
         const data = await res.json();
         setCreatedKey(data.data?.key || null);
         setNewKeyName('');
+        toast.success('API Key 已创建');
         fetchKeys();
       } else {
         const data = await res.json();
-        setError(data.error?.message || '创建失败');
+        const msg = data.error?.message || '创建失败';
+        setError(msg);
+        toast.error('创建失败：' + msg);
       }
-    } catch {
-      setError('创建请求失败');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '创建请求失败';
+      setError(msg);
+      toast.error('创建失败：' + msg);
     }
   };
 
@@ -86,8 +93,15 @@ export default function ApiKeysPage() {
         headers: { 'x-session': session?.access_token || '' },
         timeout: 8_000,
       });
-      if (res.ok) fetchKeys();
-    } catch { /* ignore */ }
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error?.message || '删除失败');
+      }
+      toast.success('API Key 已删除');
+      fetchKeys();
+    } catch (err) {
+      toast.error('删除失败：' + (err instanceof Error ? err.message : '未知错误'));
+    }
   };
 
   const toggleKey = async (keyId: string, currentActive: boolean) => {
@@ -101,8 +115,41 @@ export default function ApiKeysPage() {
         body: JSON.stringify({ is_active: !currentActive }),
         timeout: 8_000,
       });
-      if (res.ok) fetchKeys();
-    } catch { /* ignore */ }
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error?.message || '操作失败');
+      }
+      toast.success(currentActive ? '已禁用' : '已启用');
+      fetchKeys();
+    } catch (err) {
+      toast.error('操作失败：' + (err instanceof Error ? err.message : '未知错误'));
+    }
+  };
+
+  const handleCopyKey = async () => {
+    if (!createdKey) return;
+    try {
+      await navigator.clipboard.writeText(createdKey);
+      setCopied(true);
+      toast.success('已复制到剪贴板');
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // 剪贴板 API 失败（HTTPS/权限问题），引导用户手动复制
+      toast.error('复制失败，请手动选择文本并 Ctrl+C');
+      // 选中 input 让用户便于手动复制
+      try {
+        const range = document.createRange();
+        const codeEl = document.getElementById('created-key-code');
+        if (codeEl) {
+          range.selectNodeContents(codeEl);
+          const sel = window.getSelection();
+          sel?.removeAllRanges();
+          sel?.addRange(range);
+        }
+      } catch {
+        // ignore selection failures
+      }
+    }
   };
 
   return (
@@ -151,16 +198,16 @@ export default function ApiKeysPage() {
               <div>
                 <p className="text-xs text-[var(--color-text-muted)] mb-2">请立即复制此 Key，它只会显示一次：</p>
                 <div className="flex items-center gap-2 p-3 bg-[var(--color-surface-subtle)] border border-[var(--color-border)] rounded-[var(--radius-md)]">
-                  <code className="flex-1 text-xs font-mono text-[var(--color-text)] mobile-break-all break-all">{createdKey}</code>
+                  <code id="created-key-code" className="flex-1 text-xs font-mono text-[var(--color-text)] mobile-break-all break-all">{createdKey}</code>
                   <button
-                    onClick={() => navigator.clipboard.writeText(createdKey)}
+                    onClick={handleCopyKey}
                     className="px-2.5 py-1 text-xs text-[var(--color-accent)] hover:underline flex-shrink-0 tap-target"
                   >
-                    复制
+                    {copied ? '已复制' : '复制'}
                   </button>
                 </div>
                 <button
-                  onClick={() => { setShowCreateDialog(false); setCreatedKey(null); }}
+                  onClick={() => { setShowCreateDialog(false); setCreatedKey(null); setCopied(false); }}
                   className="w-full mt-4 py-2 text-xs font-medium text-[var(--color-text-muted)] border border-[var(--color-border)] rounded-[var(--radius-sm)] hover:bg-[var(--color-surface-hover)] tap-target"
                 >
                   完成

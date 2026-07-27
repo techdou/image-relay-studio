@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useCallback } from 'react';
+import { toast } from 'sonner';
 import { useAuth } from '@/lib/auth-context';
 import { ModelConfig, ProviderType } from '@/types';
 import { fetchWithTimeout } from '@/lib/fetch-utils';
@@ -76,21 +77,35 @@ export default function AdminModelsPage() {
       });
 
       if (res.ok) {
+        toast.success(editingModel ? '模型已更新' : '模型已创建');
         setShowCreate(false);
         setEditingModel(null);
         fetchModels();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error?.message || '保存失败');
       }
-    } catch { /* ignore */ }
+    } catch (err) {
+      toast.error('保存失败：' + (err instanceof Error ? err.message : '未知错误'));
+    }
   };
 
   const handleHealthCheck = async (modelId: string) => {
     try {
-      await fetch(`/api/admin/models/${modelId}/health-check`, {
+      const res = await fetch(`/api/admin/models/${modelId}/health-check`, {
         method: 'POST',
         headers: { 'x-session': session?.access_token || '' },
       });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error?.message || '健康检查失败');
+      }
+      const data = await res.json().catch(() => ({}));
+      toast.success(data.data?.message || '健康检查完成');
       fetchModels();
-    } catch { /* ignore */ }
+    } catch (err) {
+      toast.error('健康检查失败：' + (err instanceof Error ? err.message : '未知错误'));
+    }
   };
 
   if (!isAdmin) return null;

@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { authenticateRequest, successResponse, errorResponse } from '@/server/api-helpers';
+import { authenticateRequest, successResponse, errorResponse, requireScope } from '@/server/api-helpers';
 import { AppError, ErrorCodes } from '@/server/errors';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { createApiKey } from '@/server/api-keys';
@@ -7,6 +7,7 @@ import { createApiKey } from '@/server/api-keys';
 export async function GET(request: NextRequest) {
   try {
     const auth = await authenticateRequest(request);
+    requireScope(auth, 'api_keys:read');
     const supabase = getSupabaseClient();
 
     // Fetch ALL keys (including disabled ones) so user can toggle them
@@ -49,6 +50,7 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const auth = await authenticateRequest(request);
+    requireScope(auth, 'api_keys:write');
     const body = await request.json();
     const { name, expires_at, scopes } = body;
 
@@ -69,11 +71,13 @@ export async function POST(request: NextRequest) {
       throw new AppError(ErrorCodes.API_DISABLED, 'API 访问未启用');
     }
 
-    // Generate API key
+    // Generate API key. Default scope names follow the canonical naming used
+    // by the api_keys.scopes column default and the createApiKey helper:
+    //   images:read / images:write (NOT the legacy "images:generate").
     const result = await createApiKey(
       auth.userId,
       name.trim(),
-      scopes || ['images:generate', 'images:read', 'tasks:read', 'models:read'],
+      scopes || ['images:write', 'images:read', 'tasks:read', 'tasks:write', 'models:read', 'usage:read'],
       expires_at || undefined
     );
 

@@ -1,9 +1,10 @@
 import { NextRequest } from 'next/server';
-import { authenticateRequest, successResponse, errorResponse } from '@/server/api-helpers';
+import { authenticateRequest, successResponse, errorResponse, requireScope } from '@/server/api-helpers';
 
 export async function GET(request: NextRequest) {
   try {
     const auth = await authenticateRequest(request);
+    requireScope(auth, 'usage:read');
     const { getSupabaseServerClient } = await import('@/storage/database/supabase-client');
     const supabase = getSupabaseServerClient();
 

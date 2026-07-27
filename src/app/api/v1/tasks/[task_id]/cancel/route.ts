@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server';
-import { authenticateRequest, successResponse, errorResponse } from '@/server/api-helpers';
+import { authenticateRequest, successResponse, errorResponse, requireScope } from '@/server/api-helpers';
 import { AppError, ErrorCodes } from '@/server/errors';
 
 export async function POST(
@@ -9,6 +9,7 @@ export async function POST(
   try {
     const { task_id } = await params;
     const auth = await authenticateRequest(request);
+    requireScope(auth, 'tasks:write');
     const { getSupabaseServerClient } = await import('@/storage/database/supabase-client');
     const supabase = getSupabaseServerClient();
 

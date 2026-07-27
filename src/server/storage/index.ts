@@ -153,6 +153,7 @@ function ensureEnvLoaded(): void {
   }
   // Trigger dynamic env loading via supabase-client's loadEnv
   try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     require('@/storage/database/supabase-client').getSupabaseCredentials();
   } catch {
     // If supabase loading fails, continue with current env

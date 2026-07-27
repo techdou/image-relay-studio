@@ -1,6 +1,7 @@
 'use client';
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
+import { toast } from 'sonner';
 import { useAuth } from '@/lib/auth-context';
 import { fetchWithTimeout } from '@/lib/fetch-utils';
 import { ModelConfig, TaskStatus } from '@/types';
@@ -14,9 +15,11 @@ interface QuotaInfo {
   current_concurrent: number;
 }
 
-interface TaskResult {
-  task_id: string;
-  status: TaskStatus;
+interface GeneratedImage {
+  id: string;
+  url: string;
+  thumbnail_url?: string;
+  favorite: boolean;
 }
 
 export default function StudioPage() {
@@ -34,7 +37,7 @@ export default function StudioPage() {
   const [isGenerating, setIsGenerating] = useState(false);
   const [currentTaskId, setCurrentTaskId] = useState<string | null>(null);
   const [taskStatus, setTaskStatus] = useState<TaskStatus | null>(null);
-  const [generatedImages, setGeneratedImages] = useState<Array<{ id: string; url: string; thumbnail_url?: string }>>([]);
+  const [generatedImages, setGeneratedImages] = useState<GeneratedImage[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [generationEnabled, setGenerationEnabled] = useState(true);
   const [modelsLoading, setModelsLoading] = useState(true);
@@ -98,45 +101,102 @@ export default function StudioPage() {
     if (session) fetchQuota();
   }, [session]);
 
-  // Poll task status
+  // ── Poll task status with adaptive backoff ────────────────────────
+  // 替换原 setInterval(2000)：长任务下避免请求堆积，后台 tab 自动暂停。
+  const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollDelayRef = useRef(2000);
+
+  const clearPollTimer = useCallback(() => {
+    if (pollTimerRef.current !== null) {
+      clearTimeout(pollTimerRef.current);
+      pollTimerRef.current = null;
+    }
+  }, []);
+
+  const checkTaskStatus = useCallback(async () => {
+    if (!currentTaskId || !session) return false;
+    try {
+      const res = await fetchWithTimeout(`/api/v1/tasks/${currentTaskId}`, {
+        headers: { 'x-session': session?.access_token || '' },
+        timeout: 8_000,
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setTaskStatus(data.data?.status);
+
+        if (data.data?.status === 'succeeded') {
+          const imagesRes = await fetchWithTimeout(`/api/v1/images?task_id=${currentTaskId}`, {
+            headers: { 'x-session': session?.access_token || '' },
+            timeout: 8_000,
+          });
+          if (imagesRes.ok) {
+            const imagesData = await imagesRes.json();
+            setGeneratedImages((imagesData.data || []).map((img: GeneratedImage) => ({
+              id: img.id,
+              url: img.url,
+              thumbnail_url: img.thumbnail_url,
+              favorite: img.favorite ?? false,
+            })));
+          }
+          setIsGenerating(false);
+          // Switch to results view on mobile when generation completes
+          setMobileView('results');
+          return true; // 任务完成
+        }
+
+        if (data.data?.status === 'failed' || data.data?.status === 'cancelled') {
+          setError(data.data?.error_message || '生成失败');
+          setIsGenerating(false);
+          return true; // 任务结束
+        }
+      }
+    } catch {
+      // 单次轮询失败：忽略，下一轮重试
+    }
+    return false; // 任务未完成，继续轮询
+  }, [currentTaskId, session]);
+
+  const scheduleNextPoll = useCallback(() => {
+    clearPollTimer();
+    // 后台 tab 不轮询，等 visibilitychange resume
+    if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+
+    pollTimerRef.current = setTimeout(async () => {
+      const done = await checkTaskStatus();
+      if (done) return;
+      // 递增间隔，上限 10s
+      pollDelayRef.current = Math.min(pollDelayRef.current * 1.5, 10_000);
+      scheduleNextPoll();
+    }, pollDelayRef.current);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [checkTaskStatus, clearPollTimer]);
+
+  // 任务激活时启动轮询，结束/卸载时清理
   useEffect(() => {
     if (!currentTaskId || !session) return;
-    if (taskStatus === 'succeeded' || taskStatus === 'failed' || taskStatus === 'cancelled') return;
+    if (taskStatus === 'succeeded' || taskStatus === 'failed' || taskStatus === 'cancelled') {
+      clearPollTimer();
+      return;
+    }
+    // 新一轮任务：重置 delay
+    pollDelayRef.current = 2000;
+    scheduleNextPoll();
 
-    const interval = setInterval(async () => {
-      try {
-        const res = await fetchWithTimeout(`/api/v1/tasks/${currentTaskId}`, {
-          headers: { 'x-session': session?.access_token || '' },
-          timeout: 8_000,
-        });
-        if (res.ok) {
-          const data = await res.json();
-          setTaskStatus(data.data?.status);
+    return () => clearPollTimer();
+  }, [currentTaskId, taskStatus, session, scheduleNextPoll, clearPollTimer]);
 
-          if (data.data?.status === 'succeeded') {
-            const imagesRes = await fetchWithTimeout(`/api/v1/images?task_id=${currentTaskId}`, {
-              headers: { 'x-session': session?.access_token || '' },
-              timeout: 8_000,
-            });
-            if (imagesRes.ok) {
-              const imagesData = await imagesRes.json();
-              setGeneratedImages(imagesData.data || []);
-            }
-            setIsGenerating(false);
-            // Switch to results view on mobile when generation completes
-            setMobileView('results');
-          } else if (data.data?.status === 'failed') {
-            setError(data.data?.error_message || '生成失败');
-            setIsGenerating(false);
-          }
-        }
-      } catch {
-        // Ignore polling errors
+  // 标签页恢复可见时立即恢复轮询
+  useEffect(() => {
+    function handleVisibility() {
+      if (document.visibilityState === 'visible' && currentTaskId && taskStatus !== 'succeeded' && taskStatus !== 'failed' && taskStatus !== 'cancelled') {
+        // 把 delay 收回到初始值，立刻 poll 一次
+        pollDelayRef.current = 2000;
+        scheduleNextPoll();
       }
-    }, 2000);
-
-    return () => clearInterval(interval);
-  }, [currentTaskId, taskStatus, session]);
+    }
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
+  }, [currentTaskId, taskStatus, scheduleNextPoll]);
 
   const handleFileChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
@@ -205,7 +265,9 @@ export default function StudioPage() {
       const data = await res.json();
 
       if (!res.ok) {
-        setError(data.error?.message || '生成请求失败');
+        const msg = data.error?.message || '生成请求失败';
+        setError(msg);
+        toast.error('生成失败：' + msg);
         setIsGenerating(false);
         setTaskStatus(null);
         return;
@@ -213,7 +275,9 @@ export default function StudioPage() {
 
       setCurrentTaskId(data.data?.task_id);
     } catch (err) {
-      setError(err instanceof Error ? err.message : '生成请求失败');
+      const msg = err instanceof Error ? err.message : '生成请求失败';
+      setError(msg);
+      toast.error('生成失败：' + msg);
       setIsGenerating(false);
       setTaskStatus(null);
     }
@@ -232,15 +296,44 @@ export default function StudioPage() {
         timeout: 10_000,
       });
       if (!res.ok) {
-        const data = await res.json();
-        setError(data.error?.message || '重试失败');
+        const data = await res.json().catch(() => ({}));
+        const msg = data.error?.message || '重试失败';
+        setError(msg);
+        toast.error('重试失败：' + msg);
         setIsGenerating(false);
         setTaskStatus(null);
       }
-    } catch {
-      setError('重试请求失败');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : '重试请求失败';
+      setError(msg);
+      toast.error('重试失败：' + msg);
       setIsGenerating(false);
       setTaskStatus(null);
+    }
+  };
+
+  // 收藏/取消收藏：复用 gallery 页面的 PATCH /api/v1/images/:id 接口
+  const toggleFavorite = async (imageId: string, currentFavorite: boolean) => {
+    try {
+      const res = await fetchWithTimeout(`/api/v1/images/${imageId}`, {
+        method: 'PATCH',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-session': session?.access_token || '',
+        },
+        body: JSON.stringify({ favorite: !currentFavorite }),
+        timeout: 8_000,
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error?.message || '操作失败');
+      }
+      setGeneratedImages((prev) =>
+        prev.map((img) => (img.id === imageId ? { ...img, favorite: !currentFavorite } : img))
+      );
+      toast.success(currentFavorite ? '已取消收藏' : '已加入收藏');
+    } catch (err) {
+      toast.error('收藏失败：' + (err instanceof Error ? err.message : '未知错误'));
     }
   };
 
@@ -519,6 +612,7 @@ export default function StudioPage() {
                   <img
                     src={img.thumbnail_url || img.url}
                     alt="AI 生成图片"
+                    loading="lazy"
                     className="w-full h-full object-cover"
                   />
                   {/* Mobile: always show actions, Desktop: hover only */}
@@ -532,10 +626,14 @@ export default function StudioPage() {
                         下载
                       </a>
                       <button
-                        onClick={() => {/* favorite toggle */}}
-                        className="px-3 py-1.5 md:px-2.5 md:py-1 text-xs bg-white text-[var(--color-text)] rounded-[var(--radius-sm)] hover:bg-gray-100 tap-target"
+                        onClick={() => toggleFavorite(img.id, img.favorite)}
+                        className={`px-3 py-1.5 md:px-2.5 md:py-1 text-xs rounded-[var(--radius-sm)] tap-target ${
+                          img.favorite
+                            ? 'bg-[var(--color-accent)] text-white'
+                            : 'bg-white text-[var(--color-text)] hover:bg-gray-100'
+                        }`}
                       >
-                        收藏
+                        {img.favorite ? '★ 已收藏' : '☆ 收藏'}
                       </button>
                     </div>
                   </div>

@@ -1,6 +1,20 @@
 import { NextRequest } from 'next/server';
 import { authenticateRequest, successResponse, errorResponse, requireAdmin } from '@/server/api-helpers';
 import { AppError, ErrorCodes } from '@/server/errors';
+import { adminUpdateUserSchema } from '@/server/validation/admin-schemas';
+
+const QUOTA_FIELDS = [
+  'daily_image_limit',
+  'monthly_image_limit',
+  'max_concurrent_tasks',
+  'max_images_per_request',
+  'api_access_enabled',
+  'allowed_model_codes',
+  'allowed_sizes',
+  'retention_days',
+] as const;
+
+const PROFILE_FIELDS = ['display_name', 'role', 'status'] as const;
 
 export async function GET(
   request: NextRequest,
@@ -60,11 +74,18 @@ export async function PATCH(
   { params }: { params: Promise<{ user_id: string }> }
 ) {
   try {
-    const { user_id } = await params;
+    const { user_id: targetUserId } = await params;
     const auth = await authenticateRequest(request);
     requireAdmin(auth);
 
     const body = await request.json();
+    const parsed = adminUpdateUserSchema.safeParse(body);
+    if (!parsed.success) {
+      throw new AppError(ErrorCodes.VALIDATION_ERROR, 'Invalid input', {
+        issues: parsed.error.issues,
+      });
+    }
+    const data = parsed.data;
 
     const { getSupabaseServerClient } = await import('@/storage/database/supabase-client');
     const supabase = getSupabaseServerClient();
@@ -73,34 +94,60 @@ export async function PATCH(
     const { data: currentProfile } = await supabase
       .from('profiles')
       .select('*')
-      .eq('id', user_id)
+      .eq('id', targetUserId)
       .single();
 
     if (!currentProfile) throw new AppError(ErrorCodes.TASK_NOT_FOUND, '用户不存在');
 
-    // Update profile fields
+    // ── Admin self-protection ────────────────────────────────────────
+    // An admin cannot demote or disable themselves (would leave the system
+    // without an active admin if they're the only one). They also cannot
+    // demote the last remaining admin.
+    const isSelf = currentProfile.user_id === auth.userId;
+    const newRole = data.role;
+    const newStatus = data.status;
+    if (isSelf && newRole === 'user') {
+      throw new AppError(ErrorCodes.FORBIDDEN, 'Cannot demote yourself');
+    }
+    if (isSelf && newStatus === 'disabled') {
+      throw new AppError(ErrorCodes.FORBIDDEN, 'Cannot disable yourself');
+    }
+
+    if (newRole === 'user' && currentProfile.role === 'admin') {
+      // Refuse to demote the last active admin. Count active admins; the
+      // target itself still counts because the demotion hasn't happened yet.
+      const { count } = await supabase
+        .from('profiles')
+        .select('id', { count: 'exact', head: true })
+        .eq('role', 'admin')
+        .eq('status', 'active');
+      if ((count ?? 0) <= 1) {
+        throw new AppError(ErrorCodes.FORBIDDEN, 'Cannot demote the last admin');
+      }
+    }
+
+    // Update profile fields (only those explicitly provided & validated)
     const profileUpdates: Record<string, unknown> = {};
-    if (body.display_name !== undefined) profileUpdates.display_name = body.display_name;
-    if (body.status !== undefined) profileUpdates.status = body.status;
-    if (body.role !== undefined) profileUpdates.role = body.role;
+    for (const field of PROFILE_FIELDS) {
+      if (data[field] !== undefined) {
+        profileUpdates[field] = data[field];
+      }
+    }
 
     if (Object.keys(profileUpdates).length > 0) {
       const { error } = await supabase
         .from('profiles')
         .update(profileUpdates)
-        .eq('id', user_id);
+        .eq('id', targetUserId);
       if (error) throw new AppError(ErrorCodes.INTERNAL_ERROR, '更新用户失败');
     }
 
     // Update quota fields
     const quotaUpdates: Record<string, unknown> = {};
-    const quotaFields = [
-      'daily_image_limit', 'monthly_image_limit', 'max_concurrent_tasks',
-      'max_images_per_request', 'api_access_enabled', 'allowed_model_codes',
-      'allowed_sizes', 'retention_days'
-    ];
-    for (const field of quotaFields) {
-      if (body[field] !== undefined) quotaUpdates[field] = body[field];
+    for (const field of QUOTA_FIELDS) {
+      if (data[field] !== undefined) {
+        quotaUpdates[field] = data[field];
+      }
     }
 
     if (Object.keys(quotaUpdates).length > 0) {
@@ -114,7 +161,7 @@ export async function PATCH(
     // Audit log
     const { createAuditLogger } = await import('@/server/audit');
     const audit = createAuditLogger(auth.userId, auth.role, auth.requestId);
-    await audit.logAction('update_user', 'user', user_id, currentProfile, { ...profileUpdates, ...quotaUpdates });
+    await audit.logAction('update_user', 'user', targetUserId, currentProfile, { ...profileUpdates, ...quotaUpdates });
 
     return successResponse({ updated: true }, auth.requestId);
   } catch (err) {

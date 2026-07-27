@@ -1,5 +1,12 @@
 import { NextRequest } from 'next/server';
-import { authenticateRequest, successResponse, errorResponse, paginatedResponse } from '@/server/api-helpers';
+import {
+  authenticateRequest,
+  successResponse,
+  errorResponse,
+  paginatedResponse,
+  enforceGenerationRateLimit,
+  requireScope,
+} from '@/server/api-helpers';
 import { AppError, ErrorCodes } from '@/server/errors';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { createStorageClient } from '@/server/storage';
@@ -60,6 +67,9 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   try {
     const auth = await authenticateRequest(request);
+    requireScope(auth, 'images:write');
+    enforceGenerationRateLimit(auth.userId);
+
     const body = await request.json();
     const { model: modelCode, prompt, size = '1024x1024', n = 1, visible_watermark = false, reference_asset_ids = [], idempotency_key } = body;
 
@@ -69,7 +79,7 @@ export async function POST(request: NextRequest) {
 
     const supabase = getSupabaseClient();
 
-    // 1. Check generation enabled
+    // 1. Check generation enabled (fail-closed: missing = disabled)
     const { data: genSetting } = await supabase
       .from('system_settings')
       .select('value')
@@ -203,6 +213,7 @@ export async function POST(request: NextRequest) {
       request_parameters: { size, n, visible_watermark, reference_asset_ids },
       idempotency_key: idempotency_key || undefined,
       reference_asset_ids: reference_asset_ids?.length > 0 ? reference_asset_ids : undefined,
+      requestSource: auth.authMethod === 'apikey' ? 'api' : 'web',
     });
 
     // Execute task asynchronously

@@ -94,7 +94,7 @@ cp .env.example .env.local
 pnpm dev
 
 # 5. Bootstrap the first admin (idempotent)
-BOOTSTRAP_ADMIN_EMAIL=admin@yourdomain.com pnpm run bootstrap-admin
+ADMIN_EMAIL=admin@yourdomain.com BOOTSTRAP_TOKEN=xxx pnpm run bootstrap-admin
 ```
 
 ### Environment Variables
@@ -108,7 +108,8 @@ See [`.env.example`](./.env.example) for the full list. Key entries:
 | `SUPABASE_SERVICE_ROLE_KEY` | Server-only service role key | ✅ |
 | `COZE_API_TOKEN` | Coze API token for model access (server only) | ✅ |
 | `API_KEY_HASH_PEPPER` | Pepper for API key hashing (32+ chars) | ✅ prod |
-| `BOOTSTRAP_ADMIN_EMAIL` | First admin's email | bootstrap |
+| `ADMIN_EMAIL` | First admin's email | bootstrap |
+| `BOOTSTRAP_TOKEN` | Bootstrap security token (required in PROD) | ✅ prod |
 | `BOOTSTRAP_TOKEN` | Bootstrap security token | ✅ prod |
 
 ## OpenAI-compatible API

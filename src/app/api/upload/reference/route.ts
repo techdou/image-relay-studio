@@ -1,5 +1,11 @@
 import { NextRequest } from 'next/server';
-import { authenticateRequest, successResponse, errorResponse } from '@/server/api-helpers';
+import {
+  authenticateRequest,
+  successResponse,
+  errorResponse,
+  enforceUploadRateLimit,
+  requireScope,
+} from '@/server/api-helpers';
 import { AppError, ErrorCodes } from '@/server/errors';
 
 const ALLOWED_MIME_TYPES = ['image/png', 'image/jpeg', 'image/webp'];
@@ -8,6 +14,8 @@ const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 export async function POST(request: NextRequest) {
   try {
     const auth = await authenticateRequest(request);
+    requireScope(auth, 'images:write');
+    enforceUploadRateLimit(auth.userId);
     const formData = await request.formData();
     const file = formData.get('file') as File | null;
 

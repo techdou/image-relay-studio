@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import { useParams, useRouter } from 'next/navigation';
+import { toast } from 'sonner';
 import { useAuth } from '@/lib/auth-context';
 import { fetchWithTimeout } from '@/lib/fetch-utils';
 import { PageSkeleton, ErrorState } from '@/components/loading-states';
@@ -80,10 +81,16 @@ export default function AdminUserDetailPage() {
         body: JSON.stringify(updates),
       });
       if (res.ok) {
+        toast.success('用户信息已更新');
         await fetchUser();
         setEditing(false);
+      } else {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error?.message || '更新失败');
       }
-    } catch { /* ignore */ }
+    } catch (err) {
+      toast.error('更新失败：' + (err instanceof Error ? err.message : '未知错误'));
+    }
   }
 
   async function saveQuota() {

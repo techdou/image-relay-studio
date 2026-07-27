@@ -15,6 +15,7 @@ function loadEnv(): void {
 
   try {
     try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
       require('dotenv').config();
       if (process.env.COZE_SUPABASE_URL && process.env.COZE_SUPABASE_ANON_KEY) {
         envLoaded = true;
@@ -24,6 +25,7 @@ function loadEnv(): void {
       // dotenv not available
     }
 
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const { execSync } = require('child_process');
     const pythonCode = `
 import os

@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { authenticateRequest } from '@/server/api-helpers';
+import {
+  authenticateRequest,
+  enforceGenerationRateLimit,
+  requireScope,
+} from '@/server/api-helpers';
 import { AppError, ErrorCodes } from '@/server/errors';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { createTask, executeTaskSync } from '@/server/tasks/executor';
@@ -130,6 +134,8 @@ export async function POST(request: NextRequest) {
   try {
     const auth = await authenticateRequest(request);
     requestId = auth.requestId;
+    requireScope(auth, 'images:write');
+    enforceGenerationRateLimit(auth.userId);
 
     // ── Extract forward headers for SDK authentication ────────────────
     const forwardHeaders = HeaderUtils.extractForwardHeaders(request.headers);
@@ -266,13 +272,13 @@ export async function POST(request: NextRequest) {
     // ── Server-side checks (reuse generations logic) ───────────────────
     const supabase = getSupabaseClient();
 
-    // 1. Check generation enabled
+    // 1. Check generation enabled (fail-closed: missing = disabled)
     const { data: genSetting } = await supabase
       .from('system_settings')
       .select('value')
       .eq('key', 'generation_enabled')
       .single();
-    if (genSetting?.value === 'false') {
+    if (genSetting?.value !== 'true') {
       throw new AppError(ErrorCodes.GENERATION_DISABLED, 'Image generation service is currently disabled');
     }
 
@@ -484,6 +490,7 @@ export async function POST(request: NextRequest) {
       },
       reference_asset_ids: referenceAssetIds.length > 0 ? referenceAssetIds : undefined,
       custom_headers: forwardHeaders,
+      requestSource: auth.authMethod === 'apikey' ? 'api' : 'web',
     });
 
     // Update the placeholder task_id on references

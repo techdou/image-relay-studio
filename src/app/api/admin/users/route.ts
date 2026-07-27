@@ -3,6 +3,7 @@ import { authenticateRequest, successResponse, errorResponse, requireAdmin } fro
 import { AppError, ErrorCodes } from '@/server/errors';
 import { logger } from '@/server/logging';
 import { createUserSchema } from '@/server/validation/schemas';
+import { adminListUsersQuerySchema } from '@/server/validation/admin-schemas';
 
 export async function GET(request: NextRequest) {
   try {
@@ -10,10 +11,19 @@ export async function GET(request: NextRequest) {
     requireAdmin(auth);
 
     const { searchParams } = new URL(request.url);
-    const page = parseInt(searchParams.get('page') || '1');
-    const pageSize = parseInt(searchParams.get('page_size') || '20');
-    const status = searchParams.get('status');
-    const search = searchParams.get('search');
+    const rawQuery: Record<string, string | undefined> = {
+      page: searchParams.get('page') ?? undefined,
+      page_size: searchParams.get('page_size') ?? undefined,
+      status: searchParams.get('status') ?? undefined,
+      search: searchParams.get('search') ?? undefined,
+    };
+    const parsed = adminListUsersQuerySchema.safeParse(rawQuery);
+    if (!parsed.success) {
+      throw new AppError(ErrorCodes.VALIDATION_ERROR, 'Invalid query parameters', {
+        issues: parsed.error.issues,
+      });
+    }
+    const { page, page_size: pageSize, status, search } = parsed.data;
 
     const { getSupabaseServerClient } = await import('@/storage/database/supabase-client');
     const supabase = getSupabaseServerClient();
@@ -25,7 +35,14 @@ export async function GET(request: NextRequest) {
       .order('created_at', { ascending: false });
 
     if (status) query = query.eq('status', status);
-    if (search) query = query.or(`email.ilike.%${search}%,display_name.ilike.%${search}%`);
+    if (search) {
+      // `search` is already constrained by adminListUsersQuerySchema to a
+      // safe character class, so it cannot inject Postgres filter syntax.
+      // We additionally URL-encode it to neutralise any reserved chars
+      // (.or() expects a raw filter string; encoding makes the value inert).
+      const safe = encodeURIComponent(search);
+      query = query.or(`email.ilike.%${safe}%,display_name.ilike.%${safe}%`);
+    }
 
     const { data, count, error } = await query;
     if (error) throw new AppError(ErrorCodes.INTERNAL_ERROR, '查询用户失败');
@@ -96,7 +113,8 @@ export async function POST(request: NextRequest) {
         throw new AppError(ErrorCodes.INVALID_REQUEST, '该邮箱已在认证系统中注册');
       }
       logger.error('Admin create user: auth creation failed', { error: authError.message, email });
-      throw new AppError(ErrorCodes.INTERNAL_ERROR, `创建认证账号失败: ${authError.message}`);
+      // Don't leak Supabase auth internals back to the caller.
+      throw new AppError(ErrorCodes.INTERNAL_ERROR, '创建认证账号失败，请稍后重试');
     }
 
     if (!authUser.user) {

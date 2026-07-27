@@ -1,6 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useCallback } from 'react';
+import { toast } from 'sonner';
 import { useAuth } from '@/lib/auth-context';
 import { GenerationTask, ModelConfig, TaskStatus } from '@/types';
 import { fetchWithTimeout } from '@/lib/fetch-utils';
@@ -67,22 +68,36 @@ export default function AdminTasksPage() {
 
   const handleRetry = async (taskId: string) => {
     try {
-      await fetch(`/api/admin/tasks/${taskId}/retry`, {
+      const res = await fetch(`/api/admin/tasks/${taskId}/retry`, {
         method: 'POST',
         headers: { 'x-session': session?.access_token || '' },
       });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error?.message || '重试失败');
+      }
+      toast.success('已提交重试');
       fetchTasks();
-    } catch { /* ignore */ }
+    } catch (err) {
+      toast.error('重试失败：' + (err instanceof Error ? err.message : '未知错误'));
+    }
   };
 
   const handleCancel = async (taskId: string) => {
     try {
-      await fetch(`/api/admin/tasks/${taskId}/cancel`, {
+      const res = await fetch(`/api/admin/tasks/${taskId}/cancel`, {
         method: 'POST',
         headers: { 'x-session': session?.access_token || '' },
       });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error?.message || '取消失败');
+      }
+      toast.success('已取消任务');
       fetchTasks();
-    } catch { /* ignore */ }
+    } catch (err) {
+      toast.error('取消失败：' + (err instanceof Error ? err.message : '未知错误'));
+    }
   };
 
   if (!isAdmin) return null;

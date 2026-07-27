@@ -39,36 +39,6 @@ export function fetchWithTimeout(
 }
 
 /**
- * 带超时 + 自动重试的 fetch
- */
-export async function fetchWithRetry(
-  url: string,
-  options: FetchWithTimeoutOptions = {},
-  maxRetries: number = 2,
-): Promise<Response> {
-  const { timeout = 15000, ...fetchOptions } = options;
-  let lastError: Error | null = null;
-
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    try {
-      const res = await fetchWithTimeout(url, { ...fetchOptions, timeout });
-      return res;
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error('Unknown error');
-      // 超时才重试，其他错误直接抛出
-      if (lastError.name !== 'AbortError' && attempt < maxRetries) {
-        // 非 abort 错误（如网络断开），等待一会儿再试
-        await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
-        continue;
-      }
-      if (attempt < maxRetries) continue;
-    }
-  }
-
-  throw lastError || new Error('Request failed after retries');
-}
-
-/**
  * 判断是否为超时错误
  */
 export function isTimeoutError(err: unknown): boolean {

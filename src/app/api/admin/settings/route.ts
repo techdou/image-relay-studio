@@ -2,6 +2,7 @@ import { NextRequest } from 'next/server';
 import { authenticateRequest, successResponse, errorResponse, requireAdmin } from '@/server/api-helpers';
 import { AppError, ErrorCodes } from '@/server/errors';
 import { logger } from '@/server/logging';
+import { adminUpdateSettingSchema } from '@/server/validation/admin-schemas';
 
 // Descriptions for each setting key
 const SETTING_DESCRIPTIONS: Record<string, string> = {
@@ -53,9 +54,15 @@ export async function PATCH(request: NextRequest) {
     requireAdmin(auth);
 
     const body = await request.json();
-    const { key, value } = body;
+    const parsed = adminUpdateSettingSchema.safeParse(body);
+    if (!parsed.success) {
+      throw new AppError(ErrorCodes.VALIDATION_ERROR, 'Invalid input', {
+        issues: parsed.error.issues,
+      });
+    }
+    const { key, value } = parsed.data;
 
-    if (!key || value === undefined) {
+    if (value === undefined) {
       throw new AppError(ErrorCodes.INVALID_REQUEST, 'key 和 value 必填');
     }
 

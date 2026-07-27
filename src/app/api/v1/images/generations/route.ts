@@ -1,13 +1,17 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { HeaderUtils } from 'coze-coding-dev-sdk';
-import { authenticateRequest, errorResponse } from '@/server/api-helpers';
+import {
+  authenticateRequest,
+  errorResponse,
+  enforceGenerationRateLimit,
+  requireScope,
+} from '@/server/api-helpers';
 import { AppError, ErrorCodes } from '@/server/errors';
 import { getSupabaseClient } from '@/storage/database/supabase-client';
 import { createTask, executeTaskSync } from '@/server/tasks/executor';
 import type { TaskType } from '@/server/tasks/state-machine';
 import { generateSignedUrl } from '@/server/storage';
 import { logger } from '@/server/logging';
-import { checkRateLimit } from '@/server/rate-limit';
 
 // ---------------------------------------------------------------------------
 // OpenAI-compatible size mapping
@@ -71,17 +75,10 @@ export async function POST(request: NextRequest) {
     const forwardHeaders = HeaderUtils.extractForwardHeaders(request.headers);
 
     const auth = await authenticateRequest(request);
-    const body = await request.json();
+    requireScope(auth, 'images:write');
+    enforceGenerationRateLimit(auth.userId);
 
-    // ── Rate limiting (per user, 60 req/min) ──────────────────────────
-    const rateLimitResult = checkRateLimit({
-      key: `gen:${auth.userId}`,
-      maxRequests: 60,
-      windowMs: 60_000,
-    });
-    if (!rateLimitResult.allowed) {
-      throw new AppError(ErrorCodes.RATE_LIMITED, 'Too many requests. Please slow down.');
-    }
+    const body = await request.json();
 
     const {
       model: rawModel,
@@ -113,28 +110,38 @@ export async function POST(request: NextRequest) {
     const trimmedPrompt = prompt.trim();
     const moderationFlags = checkPromptModeration(trimmedPrompt);
     if (moderationFlags.length > 0) {
-      // Log moderation event for audit (best-effort, don't block on failure)
+      // Log moderation event for audit (best-effort, don't block on failure).
+      // Column names must match the `moderation_events` schema:
+      // stage / decision / reason / rule_codes(jsonb) / metadata(jsonb).
       const supabase = getSupabaseClient();
       try {
         await supabase.from('moderation_events').insert({
           user_id: auth.userId,
-          prompt: trimmedPrompt,
-          flags: moderationFlags,
-          action: 'blocked',
+          task_id: null,
+          stage: 'pre_generation',
+          decision: 'blocked',
+          reason: 'prompt_moderation',
+          rule_codes: moderationFlags,
+          metadata: { prompt: trimmedPrompt },
         });
-      } catch { /* best-effort logging */ }
+      } catch (modErr) {
+        logger.warn('Failed to record moderation event', {
+          user_id: auth.userId,
+          error: modErr instanceof Error ? modErr.message : String(modErr),
+        });
+      }
       throw new AppError(ErrorCodes.INVALID_REQUEST, 'Prompt contains prohibited content');
     }
 
     const supabase = getSupabaseClient();
 
-    // 1. Check generation enabled
+    // 1. Check generation enabled (fail-closed: missing = disabled)
     const { data: genSetting } = await supabase
       .from('system_settings')
       .select('value')
       .eq('key', 'generation_enabled')
       .single();
-    if (genSetting?.value === 'false') {
+    if (genSetting?.value !== 'true') {
       throw new AppError(ErrorCodes.GENERATION_DISABLED, 'Image generation service is currently disabled');
     }
 
@@ -247,6 +254,7 @@ export async function POST(request: NextRequest) {
       idempotency_key: idempotency_key || undefined,
       reference_asset_ids: reference_asset_ids.length > 0 ? reference_asset_ids : undefined,
       custom_headers: forwardHeaders,
+      requestSource: auth.authMethod === 'apikey' ? 'api' : 'web',
     });
 
     // ── Execute synchronously (OpenAI-compatible) ─────────────────────

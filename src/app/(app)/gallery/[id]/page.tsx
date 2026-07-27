@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useCallback } from 'react';
 import { useParams, useRouter } from 'next/navigation';
+import { toast } from 'sonner';
 import { useAuth } from '@/lib/auth-context';
 import { GenerationAsset } from '@/types';
 import { fetchWithTimeout } from '@/lib/fetch-utils';
@@ -53,8 +54,15 @@ export default function GalleryDetailPage() {
         body: JSON.stringify({ favorite: !asset.favorite }),
         timeout: 8_000,
       });
-      if (res.ok) fetchAsset();
-    } catch { /* ignore */ }
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error?.message || '操作失败');
+      }
+      toast.success(asset.favorite ? '已取消收藏' : '已加入收藏');
+      fetchAsset();
+    } catch (err) {
+      toast.error('收藏失败：' + (err instanceof Error ? err.message : '未知错误'));
+    }
   };
 
   const deleteAsset = async () => {
@@ -65,14 +73,22 @@ export default function GalleryDetailPage() {
         headers: { 'x-session': session?.access_token || '' },
         timeout: 8_000,
       });
-      if (res.ok) router.push('/gallery');
-    } catch { /* ignore */ }
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        throw new Error(data.error?.message || '删除失败');
+      }
+      toast.success('图片已删除');
+      router.push('/gallery');
+    } catch (err) {
+      toast.error('删除失败：' + (err instanceof Error ? err.message : '未知错误'));
+    }
   };
 
   const downloadAsset = async () => {
     if (!asset?.url) return;
     try {
       const response = await fetch(asset.url);
+      if (!response.ok) throw new Error('下载失败');
       const blob = await response.blob();
       const blobUrl = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
@@ -80,7 +96,9 @@ export default function GalleryDetailPage() {
       link.download = `image-${asset.id.slice(0, 8)}.png`;
       link.click();
       window.URL.revokeObjectURL(blobUrl);
-    } catch { /* ignore */ }
+    } catch (err) {
+      toast.error('下载失败：' + (err instanceof Error ? err.message : '未知错误'));
+    }
   };
 
   if (isLoading) {
@@ -182,16 +200,20 @@ export default function GalleryDetailPage() {
                 <span className="text-xs text-[var(--color-text)]">{asset.width}×{asset.height}</span>
               </div>
             )}
-            {asset.file_size != null && (
-              <div className="px-3 py-2.5 flex justify-between">
-                <span className="text-xs text-[var(--color-text-muted)]">文件大小</span>
-                <span className="text-xs text-[var(--color-text)]">
-                  {asset.file_size! > 1024 * 1024
-                    ? `${(asset.file_size! / 1024 / 1024).toFixed(1)} MB`
-                    : `${(asset.file_size! / 1024).toFixed(0)} KB`}
-                </span>
-              </div>
-            )}
+            {(() => {
+              const size = asset.file_size;
+              if (size == null) return null;
+              return (
+                <div className="px-3 py-2.5 flex justify-between">
+                  <span className="text-xs text-[var(--color-text-muted)]">文件大小</span>
+                  <span className="text-xs text-[var(--color-text)]">
+                    {size > 1024 * 1024
+                      ? `${(size / 1024 / 1024).toFixed(1)} MB`
+                      : `${(size / 1024).toFixed(0)} KB`}
+                  </span>
+                </div>
+              );
+            })()}
             {asset.mime_type && (
               <div className="px-3 py-2.5 flex justify-between">
                 <span className="text-xs text-[var(--color-text-muted)]">格式</span>
